@@ -7218,6 +7218,7 @@ dependencies = [
  "url",
  "util",
  "watch",
+ "which",
  "workspace",
  "zed_actions",
  "zlog",
