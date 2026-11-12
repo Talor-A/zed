@@ -291,6 +291,43 @@ For example:
 ]
 ```
 
+## Custom jj Commands
+
+The jj log (`jj_log: open`) can run tasks against the revision under the cursor.
+To add a command, define a task in your global `tasks.json` file with the `jj-command` tag.
+Run one with `jj_log::RunCommand` (`!` by default), which shows a picker of every `jj-command` task, or bind a key to a single task with `["jj_log::RunCommandByName", { "task_name": "<label>" }]`.
+Tasks run from the jj workspace root by default.
+
+jj command tasks support these task variables:
+
+- `ZED_JJ_CHANGE_ID`: full change ID of the revision under the cursor.
+- `ZED_JJ_CHANGE_ID_SHORT`: shortest unique prefix of the change ID.
+- `ZED_JJ_COMMIT_ID`: full commit ID of the revision under the cursor.
+- `ZED_JJ_COMMIT_ID_SHORT`: shortest unique prefix of the commit ID.
+- `ZED_JJ_BOOKMARKS`: space-separated local bookmarks on the revision.
+- `ZED_JJ_REPOSITORY_PATH`: absolute path to the jj workspace root.
+
+`ZED_GIT_SHA` and `ZED_GIT_SHA_SHORT` are also set to the commit ID.
+
+For example:
+
+```json [tasks]
+[
+  {
+    "label": "jj absorb from $ZED_JJ_CHANGE_ID_SHORT",
+    "command": "jj",
+    "args": ["absorb", "--from", "$ZED_JJ_CHANGE_ID"],
+    "tags": ["jj-command"]
+  },
+  {
+    "label": "jj split $ZED_JJ_CHANGE_ID_SHORT",
+    "command": "jj",
+    "args": ["split", "-r", "$ZED_JJ_CHANGE_ID"],
+    "tags": ["jj-command"]
+  }
+]
+```
+
 ## VS Code Task Format
 
 When importing VS Code tasks from `.vscode/tasks.json`, you can omit the `label` field. Zed automatically generates labels based on the task type:

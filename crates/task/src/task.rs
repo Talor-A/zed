@@ -195,6 +195,18 @@ pub enum VariableName {
     GitRepositoryPath,
     /// Name of the Git ref (branch, remote ref, or tag) associated with the task context.
     GitRef,
+    /// Full change ID of the jj change associated with the task context.
+    JjChangeId,
+    /// Shortest unique prefix of the jj change ID associated with the task context.
+    JjChangeIdShort,
+    /// Full commit ID of the jj change associated with the task context.
+    JjCommitId,
+    /// Shortest unique prefix of the jj commit ID associated with the task context.
+    JjCommitIdShort,
+    /// Space-separated local bookmarks pointing at the jj change associated with the task context.
+    JjBookmarks,
+    /// Absolute path of the jj workspace root associated with the task context.
+    JjRepositoryPath,
     /// Custom variable, provided by the plugin or other external source.
     /// Will be printed with `CUSTOM_` prefix to avoid potential conflicts with other variables.
     Custom(Cow<'static, str>),
@@ -236,6 +248,12 @@ impl FromStr for VariableName {
             "GIT_REPOSITORY_NAME" => Self::GitRepositoryName,
             "GIT_REPOSITORY_PATH" => Self::GitRepositoryPath,
             "GIT_REF" => Self::GitRef,
+            "JJ_CHANGE_ID" => Self::JjChangeId,
+            "JJ_CHANGE_ID_SHORT" => Self::JjChangeIdShort,
+            "JJ_COMMIT_ID" => Self::JjCommitId,
+            "JJ_COMMIT_ID_SHORT" => Self::JjCommitIdShort,
+            "JJ_BOOKMARKS" => Self::JjBookmarks,
+            "JJ_REPOSITORY_PATH" => Self::JjRepositoryPath,
             _ => {
                 if let Some(custom_name) =
                     without_prefix.strip_prefix(ZED_CUSTOM_VARIABLE_NAME_PREFIX)
@@ -277,6 +295,12 @@ impl std::fmt::Display for VariableName {
             Self::GitRepositoryName => write!(f, "{ZED_VARIABLE_NAME_PREFIX}GIT_REPOSITORY_NAME"),
             Self::GitRepositoryPath => write!(f, "{ZED_VARIABLE_NAME_PREFIX}GIT_REPOSITORY_PATH"),
             Self::GitRef => write!(f, "{ZED_VARIABLE_NAME_PREFIX}GIT_REF"),
+            Self::JjChangeId => write!(f, "{ZED_VARIABLE_NAME_PREFIX}JJ_CHANGE_ID"),
+            Self::JjChangeIdShort => write!(f, "{ZED_VARIABLE_NAME_PREFIX}JJ_CHANGE_ID_SHORT"),
+            Self::JjCommitId => write!(f, "{ZED_VARIABLE_NAME_PREFIX}JJ_COMMIT_ID"),
+            Self::JjCommitIdShort => write!(f, "{ZED_VARIABLE_NAME_PREFIX}JJ_COMMIT_ID_SHORT"),
+            Self::JjBookmarks => write!(f, "{ZED_VARIABLE_NAME_PREFIX}JJ_BOOKMARKS"),
+            Self::JjRepositoryPath => write!(f, "{ZED_VARIABLE_NAME_PREFIX}JJ_REPOSITORY_PATH"),
             Self::Custom(s) => write!(
                 f,
                 "{ZED_VARIABLE_NAME_PREFIX}{ZED_CUSTOM_VARIABLE_NAME_PREFIX}{s}"

@@ -50,6 +50,7 @@ mod git_panel_settings;
 pub mod git_picker;
 mod git_runtime_diagnostics;
 mod git_timestamp;
+pub mod jj_log;
 pub mod multi_diff_view;
 pub mod picker_prompt;
 pub mod project_diff;
@@ -68,6 +69,7 @@ pub fn init(cx: &mut App) {
     editor::set_blame_renderer(blame_ui::GitBlameRenderer, cx);
     commit_view::init(cx);
     git_graph::init(cx);
+    jj_log::init(cx);
 
     git_ui_core::set_branch_picker_builder(
         |workspace, repository, window, cx| {

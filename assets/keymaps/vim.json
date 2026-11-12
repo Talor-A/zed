@@ -1184,6 +1184,13 @@
     },
   },
   {
+    "context": "JjDescribe > Editor && VimControl && vim_mode == normal",
+    "bindings": {
+      "ctrl-c": "menu::Cancel",
+      "escape": "menu::Cancel",
+    },
+  },
+  {
     "context": "GitCommit > Editor && VimControl && vim_mode == normal",
     "bindings": {
       "ctrl-c": "menu::Cancel",
