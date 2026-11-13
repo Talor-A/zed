@@ -5,10 +5,10 @@ use editor::Editor;
 use futures::{StreamExt as _, channel::oneshot, future::Shared};
 use fuzzy::{StringMatch, StringMatchCandidate};
 use gpui::{
-    App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, FontStyle,
-    FontWeight, HighlightStyle, Hsla, KeyContext, ScrollStrategy, SharedString, StyledText,
-    Subscription, Task, UnderlineStyle, UniformListScrollHandle, WeakEntity, Window, actions,
-    uniform_list,
+    App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, Font, FontFeatures,
+    FontStyle, FontWeight, HighlightStyle, Hsla, KeyContext, ScrollStrategy, SharedString,
+    StyledText, Subscription, Task, UnderlineStyle, UniformListScrollHandle, WeakEntity, Window,
+    actions, uniform_list,
 };
 use notifications::status_toast::StatusToast;
 use picker::{Picker, PickerDelegate};
@@ -21,6 +21,7 @@ use std::{
     time::Duration,
 };
 use task::{Shell, TaskContext, TaskVariables, VariableName};
+use terminal::terminal_settings::TerminalSettings;
 use theme_settings::ThemeSettings;
 use ui::{HighlightedLabel, KeyBinding, ListItem, ListItemSpacing, prelude::*};
 use util::ResultExt as _;
@@ -561,6 +562,44 @@ enum Placement {
 struct Status {
     message: SharedString,
     is_error: bool,
+}
+
+struct LogTextStyle {
+    font: Font,
+    font_size: Pixels,
+    line_height: Pixels,
+}
+
+fn log_text_style(cx: &App) -> LogTextStyle {
+    let theme_settings = ThemeSettings::get_global(cx);
+    let terminal_settings = TerminalSettings::get_global(cx);
+    let font_size = terminal_settings.font_size.map_or_else(
+        || theme_settings.buffer_font_size(cx),
+        |font_size| theme_settings::adjusted_font_size(font_size, cx),
+    );
+    let font = Font {
+        family: terminal_settings.font_family.as_ref().map_or_else(
+            || theme_settings.buffer_font.family.clone(),
+            |font_family| font_family.0.clone().into(),
+        ),
+        fallbacks: terminal_settings
+            .font_fallbacks
+            .as_ref()
+            .or(theme_settings.buffer_font.fallbacks.as_ref())
+            .cloned(),
+        features: terminal_settings
+            .font_features
+            .clone()
+            .unwrap_or_else(FontFeatures::disable_ligatures),
+        weight: terminal_settings.font_weight.unwrap_or_default(),
+        style: FontStyle::Normal,
+    };
+
+    LogTextStyle {
+        font,
+        font_size,
+        line_height: font_size * terminal_settings.line_height.value(),
+    }
 }
 
 pub struct JjLog {
@@ -1769,8 +1808,7 @@ impl JjLog {
     }
 
     fn line_height(&self, cx: &App) -> Pixels {
-        let settings = ThemeSettings::get_global(cx);
-        settings.buffer_font_size(cx) * settings.line_height()
+        log_text_style(cx).line_height
     }
 
     fn key_context(&self, cx: &App) -> KeyContext {
@@ -2037,10 +2075,10 @@ impl Item for JjLog {
 
 impl Render for JjLog {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let settings = ThemeSettings::get_global(cx);
-        let font = settings.buffer_font.clone();
-        let font_size = settings.buffer_font_size(cx);
-        let line_height = self.line_height(cx);
+        let text_style = log_text_style(cx);
+        let font = text_style.font;
+        let font_size = text_style.font_size;
+        let line_height = text_style.line_height;
         let colors = cx.theme().colors();
         let line_count = self.lines.len();
 
