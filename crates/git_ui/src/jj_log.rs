@@ -10,6 +10,7 @@ use gpui::{
     Subscription, Task, UnderlineStyle, UniformListScrollHandle, WeakEntity, Window, actions,
     uniform_list,
 };
+use notifications::status_toast::StatusToast;
 use picker::{Picker, PickerDelegate};
 use project::{Project, git_store::Repository};
 use settings::Settings as _;
@@ -579,6 +580,7 @@ pub struct JjLog {
     status: Option<Status>,
     refresh_task: Option<Task<()>>,
     refresh_queued: bool,
+    last_refresh_error: Option<String>,
     command_task: Option<Task<()>>,
     _op_heads_watch: Task<()>,
     _subscriptions: Vec<Subscription>,
@@ -630,6 +632,7 @@ impl JjLog {
             status: None,
             refresh_task: None,
             refresh_queued: false,
+            last_refresh_error: None,
             command_task: None,
             _op_heads_watch: op_heads_watch,
             _subscriptions: subscriptions,
@@ -676,8 +679,21 @@ impl JjLog {
             this.update(cx, |this, cx| {
                 this.refresh_task = None;
                 match output {
-                    Ok(parsed) => this.apply_log(parsed, cx),
-                    Err(error) => this.set_status(format!("{error:#}"), true, cx),
+                    Ok(parsed) => {
+                        this.last_refresh_error = None;
+                        this.apply_log(parsed, cx);
+                    }
+                    Err(error) => {
+                        // The log refreshes on every focus, so only toast an
+                        // error the first time it appears.
+                        let message = plain_error_text(&error);
+                        if this.last_refresh_error.as_ref() != Some(&message) {
+                            this.last_refresh_error = Some(message);
+                            this.report_error("log".to_string(), error, cx);
+                        } else {
+                            this.set_status(error_summary(&message), true, cx);
+                        }
+                    }
                 }
                 if std::mem::take(&mut this.refresh_queued) {
                     this.refresh(cx);
@@ -751,6 +767,57 @@ impl JjLog {
             is_error,
         });
         cx.notify();
+    }
+
+    /// Shows the first line of a failed jj command in the status bar, and the
+    /// whole error in a toast like the one git commands use.
+    fn report_error(&mut self, operation: String, error: anyhow::Error, cx: &mut Context<Self>) {
+        let message = plain_error_text(&error);
+        let summary = error_summary(&message);
+        self.set_status(summary.clone(), true, cx);
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        cx.defer(move |cx| {
+            workspace.update(cx, |workspace, cx| {
+                let workspace_handle = cx.weak_entity();
+                let title = format!("jj {operation} failed: {summary}");
+                let toast = StatusToast::new(title, cx, |this, _| {
+                    this.icon(
+                        Icon::new(IconName::XCircle)
+                            .size(IconSize::Small)
+                            .color(Color::Error),
+                    )
+                    .action("View Log", move |window, cx| {
+                        workspace_handle
+                            .update(cx, |workspace, cx| {
+                                open_error_output(&operation, &message, workspace, window, cx)
+                            })
+                            .log_err();
+                    })
+                });
+                workspace.toggle_status_toast(toast, cx);
+            });
+        });
+    }
+
+    /// Reports the error of a background step, such as loading bookmarks for a
+    /// picker, instead of only logging it.
+    fn report_task_error(
+        &mut self,
+        operation: &'static str,
+        task: Task<Result<()>>,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn(async move |this, cx| {
+            if let Err(error) = task.await {
+                this.update(cx, |this, cx| {
+                    this.report_error(operation.to_string(), error, cx)
+                })
+                .log_err();
+            }
+        })
+        .detach();
     }
 
     fn move_cursor(&mut self, line: usize, cx: &mut Context<Self>) {
@@ -950,6 +1017,7 @@ impl JjLog {
             return;
         }
         self.set_status(format!("Running jj {}…", args.join(" ")), false, cx);
+        let operation = command_name(&args);
         let runner = self.runner.clone();
         self.command_task = Some(cx.spawn(async move |this, cx| {
             let result = cx
@@ -973,7 +1041,7 @@ impl JjLog {
                         this.set_status(message, false, cx);
                         on_success(this, cx);
                     }
-                    Err(error) => this.set_status(format!("{error:#}"), true, cx),
+                    Err(error) => this.report_error(operation, error, cx),
                 }
                 this.refresh(cx);
             })
@@ -1267,7 +1335,7 @@ impl JjLog {
         let runner = self.runner.clone();
         let workspace = self.workspace.clone();
         let this = cx.weak_entity();
-        cx.spawn_in(window, async move |_, cx| {
+        let task = cx.spawn_in(window, async move |_, cx| {
             let description = cx
                 .background_spawn({
                     let revset = revision.revset().to_string();
@@ -1285,8 +1353,8 @@ impl JjLog {
                 });
             })?;
             anyhow::Ok(())
-        })
-        .detach_and_log_err(cx);
+        });
+        self.report_task_error("describe", task, cx);
     }
 
     fn save_description(&mut self, revision: &Revision, message: String, cx: &mut Context<Self>) {
@@ -1306,7 +1374,7 @@ impl JjLog {
     fn fetch(&mut self, _: &Fetch, window: &mut Window, cx: &mut Context<Self>) {
         let runner = self.runner.clone();
         let workspace = self.workspace.clone();
-        cx.spawn_in(window, async move |this, cx| {
+        let task = cx.spawn_in(window, async move |this, cx| {
             let remotes = cx
                 .background_spawn(async move { runner.run(&["git", "remote", "list"]).await })
                 .await?
@@ -1343,8 +1411,8 @@ impl JjLog {
                 this.run_command(args, None, cx);
             })?;
             anyhow::Ok(())
-        })
-        .detach_and_log_err(cx);
+        });
+        self.report_task_error("git fetch", task, cx);
     }
 
     fn push(&mut self, _: &Push, window: &mut Window, cx: &mut Context<Self>) {
@@ -1394,7 +1462,7 @@ impl JjLog {
         cx: &mut Context<Self>,
     ) {
         let runner = self.runner.clone();
-        cx.spawn_in(window, async move |this, cx| {
+        let task = cx.spawn_in(window, async move |this, cx| {
             let bookmarks = cx
                 .background_spawn(async move { list_local_bookmarks(&runner).await })
                 .await?;
@@ -1417,8 +1485,8 @@ impl JjLog {
                 );
             })?;
             anyhow::Ok(())
-        })
-        .detach_and_log_err(cx);
+        });
+        self.report_task_error("bookmark list", task, cx);
     }
 
     fn set_bookmark(&mut self, _: &SetBookmark, window: &mut Window, cx: &mut Context<Self>) {
@@ -1427,7 +1495,7 @@ impl JjLog {
         };
         let runner = self.runner.clone();
         let workspace = self.workspace.clone();
-        cx.spawn_in(window, async move |this, cx| {
+        let task = cx.spawn_in(window, async move |this, cx| {
             let bookmarks = cx
                 .background_spawn(async move { list_local_bookmarks(&runner).await })
                 .await?;
@@ -1478,8 +1546,8 @@ impl JjLog {
                 }
             })?;
             anyhow::Ok(())
-        })
-        .detach_and_log_err(cx);
+        });
+        self.report_task_error("bookmark list", task, cx);
     }
 
     fn delete_bookmark(&mut self, _: &DeleteBookmark, window: &mut Window, cx: &mut Context<Self>) {
@@ -1515,7 +1583,7 @@ impl JjLog {
 
     fn change_revset(&mut self, _: &ChangeRevset, window: &mut Window, cx: &mut Context<Self>) {
         let workspace = self.workspace.clone();
-        cx.spawn_in(window, async move |this, cx| {
+        let task = cx.spawn_in(window, async move |this, cx| {
             let choice = workspace
                 .update_in(cx, |workspace, window, cx| {
                     text_prompt(
@@ -1538,8 +1606,8 @@ impl JjLog {
                 this.refresh(cx);
             })?;
             anyhow::Ok(())
-        })
-        .detach_and_log_err(cx);
+        });
+        self.report_task_error("log", task, cx);
     }
 
     fn prompt_then(
@@ -1551,13 +1619,13 @@ impl JjLog {
         on_choice: impl FnOnce(&mut Self, usize, &mut Context<Self>) + 'static,
     ) {
         let choice = picker_prompt::prompt(prompt, options, self.workspace.clone(), window, cx);
-        cx.spawn(async move |this, cx| {
+        let task = cx.spawn(async move |this, cx| {
             if let Some(index) = choice.await {
                 this.update(cx, |this, cx| on_choice(this, index, cx))?;
             }
             anyhow::Ok(())
-        })
-        .detach_and_log_err(cx);
+        });
+        self.report_task_error("prompt", task, cx);
     }
 
     fn task_context(&self, revision: &Revision) -> TaskContext {
@@ -1657,7 +1725,7 @@ impl JjLog {
         let prompt = format!("Run a jj command on {}", revision.short_id());
         let choice =
             text_prompt_without_custom(&prompt, options, self.workspace.clone(), window, cx);
-        cx.spawn_in(window, async move |this, cx| {
+        let task = cx.spawn_in(window, async move |this, cx| {
             if let Some(index) = choice.await
                 && index < commands.len()
             {
@@ -1667,8 +1735,8 @@ impl JjLog {
                 })?;
             }
             anyhow::Ok(())
-        })
-        .detach_and_log_err(cx);
+        });
+        self.report_task_error("run command", task, cx);
     }
 
     fn run_custom_command_by_name(
@@ -1831,6 +1899,60 @@ fn open_commit_diff(
         window,
         cx,
     );
+}
+
+/// The error's text without color codes. `jj log` runs with `--color=always`,
+/// which colors its errors too.
+fn plain_error_text(error: &anyhow::Error) -> String {
+    let (text, _) = parse_ansi(&format!("{error:#}"));
+    text.trim().to_string()
+}
+
+/// The line of jj's output that says what went wrong. jj can print progress,
+/// like the bookmarks it's about to push, before its `Error:` line.
+fn error_summary(message: &str) -> String {
+    let mut lines = message.lines().map(str::trim);
+    if let Some(error) = lines.clone().find_map(|line| line.strip_prefix("Error: ")) {
+        return error.to_string();
+    }
+    lines
+        .find(|line| !line.is_empty())
+        .unwrap_or("Unknown error")
+        .to_string()
+}
+
+/// The jj subcommand being run, for error titles. Arguments are left out
+/// because some, like a description, can be long.
+fn command_name(args: &[String]) -> String {
+    match args {
+        [group, subcommand, ..] if group == "git" || group == "bookmark" => {
+            format!("{group} {subcommand}")
+        }
+        [command, ..] => command.clone(),
+        [] => String::new(),
+    }
+}
+
+fn open_error_output(
+    operation: &str,
+    output: &str,
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let buffer = cx.new(|cx| language::Buffer::local(output, cx));
+    buffer.update(cx, |buffer, cx| {
+        buffer.set_capability(language::Capability::ReadOnly, cx);
+    });
+    let editor = cx.new(|cx| {
+        let mut editor = Editor::for_buffer(buffer, None, window, cx);
+        editor.buffer().update(cx, |buffer, cx| {
+            buffer.set_title(format!("Output from jj {operation}"), cx);
+        });
+        editor.set_read_only(true);
+        editor
+    });
+    workspace.add_item_to_center(Box::new(editor), window, cx);
 }
 
 fn capitalize(text: &str) -> String {
@@ -2472,6 +2594,53 @@ mod tests {
         let revision = parse_marker("x\x1fx\x1fabc\x1fa\x1f\x1f1\x1f\x1f1\x1f", 0).unwrap();
         assert_eq!(revision.revset(), "abc");
         assert_eq!(revision.short_id(), "a");
+    }
+
+    #[test]
+    fn test_error_summary_of_jj_error() {
+        assert_eq!(
+            error_summary(
+                "\nError: Refusing to create new remote bookmark jj-log@origin\nHint: Run `jj bookmark track jj-log@origin` and try again."
+            ),
+            "Refusing to create new remote bookmark jj-log@origin"
+        );
+        assert_eq!(
+            error_summary(
+                "Changes to push to origin:\n  bookmark: feature [add to 34263660a13f]\nError: No git remote named 'origin'"
+            ),
+            "No git remote named 'origin'"
+        );
+        assert_eq!(
+            error_summary("jj exited with status 1"),
+            "jj exited with status 1"
+        );
+        assert_eq!(error_summary(""), "Unknown error");
+    }
+
+    #[test]
+    fn test_plain_error_text_strips_colors() {
+        let error = anyhow!("\x1b[1m\x1b[38;5;1mError: \x1b[39mFailed to parse revset\x1b[0m\n");
+        let message = plain_error_text(&error);
+        assert_eq!(message, "Error: Failed to parse revset");
+        assert_eq!(error_summary(&message), "Failed to parse revset");
+    }
+
+    #[test]
+    fn test_command_name_leaves_out_arguments() {
+        let args = |args: &[&str]| args.iter().map(ToString::to_string).collect::<Vec<_>>();
+        assert_eq!(
+            command_name(&args(&["git", "push", "-b", "main"])),
+            "git push"
+        );
+        assert_eq!(
+            command_name(&args(&["bookmark", "move", "main"])),
+            "bookmark move"
+        );
+        assert_eq!(
+            command_name(&args(&["describe", "-r", "x", "-m", "a long message"])),
+            "describe"
+        );
+        assert_eq!(command_name(&[]), "");
     }
 
     #[test]
