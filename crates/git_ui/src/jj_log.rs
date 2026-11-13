@@ -11,7 +11,7 @@ use gpui::{
     uniform_list,
 };
 use picker::{Picker, PickerDelegate};
-use project::Project;
+use project::{Project, git_store::Repository};
 use settings::Settings as _;
 use std::{
     ops::Range,
@@ -1240,28 +1240,24 @@ impl JjLog {
         // index matching it, so git's uncommitted changes are exactly `@`'s
         // changes, shown on the real, editable files. With several parents,
         // HEAD can only name one of them, so merges keep the commit view.
-        if revision.is_working_copy && revision.parent_count == 1 {
+        let show_working_copy = revision.is_working_copy && revision.parent_count == 1;
+        if show_working_copy {
             repository.update(cx, |repository, cx| repository.set_as_active_repository(cx));
-            let workspace = self.workspace.clone();
-            // Adding a tab reads every item in the pane, this log included,
-            // which panics while this log is still being updated.
-            window.defer(cx, move |window, cx| {
-                workspace
-                    .update(cx, |workspace, cx| {
-                        ProjectDiff::deploy_at(workspace, None, window, cx);
-                    })
-                    .log_err();
-            });
-            return;
         }
-        CommitView::open(
-            revision.commit_id,
-            repository.downgrade(),
-            self.workspace.clone(),
-            Default::default(),
-            window,
-            cx,
-        );
+        let workspace = self.workspace.clone();
+        // Adding or activating a tab reads every item in the pane, this log
+        // included, which panics while this log is still being updated.
+        window.defer(cx, move |window, cx| {
+            workspace
+                .update(cx, |workspace, cx| {
+                    if show_working_copy {
+                        open_working_copy_diff(workspace, repository, window, cx);
+                    } else {
+                        open_commit_diff(workspace, repository, revision.commit_id, window, cx);
+                    }
+                })
+                .log_err();
+        });
     }
 
     fn describe(&mut self, _: &Describe, window: &mut Window, cx: &mut Context<Self>) {
@@ -1777,6 +1773,64 @@ impl JjLog {
             .child(text)
             .into_any_element()
     }
+}
+
+/// Shows the uncommitted changes view, reusing an open one as it is.
+///
+/// `ProjectDiff::deploy_at` also reuses an open view but first moves its cursor
+/// to the top. When the first file is collapsed, that lands inside the file's
+/// hidden lines and leaves vim in visual mode over them, so the open view is
+/// activated here without moving anything.
+fn open_working_copy_diff(
+    workspace: &mut Workspace,
+    repository: Entity<Repository>,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let Some(existing) = workspace.items_of_type::<ProjectDiff>(cx).next() else {
+        ProjectDiff::deploy_at(workspace, None, window, cx);
+        return;
+    };
+    let shows_repository = existing
+        .read(cx)
+        .repo(cx)
+        .is_some_and(|current| current == repository);
+    if !shows_repository {
+        existing.update(cx, |project_diff, cx| {
+            project_diff.set_repo(Some(repository), cx)
+        });
+    }
+    workspace.activate_item(&existing, true, true, window, cx);
+}
+
+/// Shows a commit, reusing an open view of the same commit so its collapsed
+/// files stay collapsed. A commit ID always names the same diff, so an open
+/// view is never stale.
+fn open_commit_diff(
+    workspace: &mut Workspace,
+    repository: Entity<Repository>,
+    commit_id: String,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let existing = workspace.items_of_type::<CommitView>(cx).find(|view| {
+        let view = view.read(cx);
+        view.commit_sha().as_ref() == commit_id
+            && view.shows_whole_commit()
+            && view.repository() == &repository
+    });
+    if let Some(existing) = existing {
+        workspace.activate_item(&existing, true, true, window, cx);
+        return;
+    }
+    CommitView::open(
+        commit_id,
+        repository.downgrade(),
+        workspace.weak_handle(),
+        Default::default(),
+        window,
+        cx,
+    );
 }
 
 fn capitalize(text: &str) -> String {

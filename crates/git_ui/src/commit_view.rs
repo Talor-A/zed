@@ -215,6 +215,12 @@ impl CommitView {
         &self.commit.sha
     }
 
+    /// Whether this view shows every file of a commit, rather than one file
+    /// or a stash.
+    pub(crate) fn shows_whole_commit(&self) -> bool {
+        self.stash.is_none() && self.file_filter.is_none()
+    }
+
     pub(crate) fn repository(&self) -> &Entity<Repository> {
         &self.repository
     }
