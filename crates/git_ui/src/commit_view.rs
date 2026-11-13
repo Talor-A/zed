@@ -9,7 +9,7 @@ use editor::{
     scroll::ScrollAnchor,
 };
 use futures_lite::future::yield_now;
-use git::repository::{CommitDetails, RepoPath};
+use git::repository::{CommitDetails, RangeLog, RepoPath};
 use git::status::{FileStatus, StatusCode, TrackedStatus};
 use git::{
     BuildCommitPermalinkParams, GitHostingProviderRegistry, GitRemote, ParsedGitRemote,
@@ -91,8 +91,24 @@ pub struct CommitView {
     is_shallow_boundary: bool,
     file_filter: Option<RepoPath>,
     reveal_file: Option<RepoPath>,
+    range: Option<CommitRange>,
+    range_expanded: bool,
     _load_diff_task: Task<Result<()>>,
 }
+
+/// The commits shown by a view of a range of commits. `commit` holds the head,
+/// and `base` is excluded from the range.
+#[derive(Clone)]
+pub(crate) struct CommitRange {
+    base: CommitDetails,
+    log: RangeLog,
+}
+
+/// Most commits loaded for a range's header. The header still counts every
+/// commit in the range.
+const RANGE_LOG_LIMIT: usize = 100;
+/// Commits listed in a range's header before the rest are folded away.
+const RANGE_COLLAPSED_COMMIT_COUNT: usize = 5;
 
 pub(crate) struct GitBlob {
     pub(crate) path: RepoPath,
@@ -219,7 +235,15 @@ impl CommitView {
     /// Whether this view shows every file of a commit, rather than one file
     /// or a stash.
     pub(crate) fn shows_whole_commit(&self) -> bool {
-        self.stash.is_none() && self.file_filter.is_none()
+        self.stash.is_none() && self.file_filter.is_none() && self.range.is_none()
+    }
+
+    /// The base and head of the range this view shows, if it shows a range
+    /// rather than one commit.
+    pub(crate) fn range_endpoints(&self) -> Option<(&SharedString, &SharedString)> {
+        self.range
+            .as_ref()
+            .map(|range| (&range.base.sha, &self.commit.sha))
     }
 
     pub(crate) fn repository(&self) -> &Entity<Repository> {
@@ -267,6 +291,7 @@ impl CommitView {
                             CommitView::new(
                                 commit_details,
                                 commit_diff,
+                                None,
                                 repo,
                                 project.clone(),
                                 workspace_entity,
@@ -278,16 +303,19 @@ impl CommitView {
 
                         let pane = workspace.active_pane();
                         pane.update(cx, |pane, cx| {
+                            let shows_commit = |view: &Entity<CommitView>, cx: &App| {
+                                let view = view.read(cx);
+                                view.commit.sha == commit_sha && view.range.is_none()
+                            };
                             let ix = pane.items().position(|item| {
-                                let commit_view = item.downcast::<CommitView>();
-                                commit_view
-                                    .is_some_and(|view| view.read(cx).commit.sha == commit_sha)
+                                item.downcast::<CommitView>()
+                                    .is_some_and(|view| shows_commit(&view, cx))
                             });
                             if let Some(ix) = ix {
                                 let existing = pane
                                     .items()
                                     .filter_map(|item| item.downcast::<CommitView>())
-                                    .find(|view| view.read(cx).commit.sha == commit_sha)
+                                    .find(|view| shows_commit(view, cx))
                                     .unwrap();
 
                                 pane.remove_item(existing.item_id(), false, false, window, cx);
@@ -309,9 +337,63 @@ impl CommitView {
             .detach();
     }
 
+    /// Shows the changes from the tree of `base` to the tree of `head`, along
+    /// with the commits between them. `base` must be a full commit SHA.
+    pub fn open_range(
+        base: String,
+        head: String,
+        repository: Entity<Repository>,
+        workspace: WeakEntity<Workspace>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Task<Result<()>> {
+        let (range_diff, range_log, base_details, head_details) =
+            repository.update(cx, |repository, cx| {
+                (
+                    repository.load_range_diff(base.clone(), head.clone(), cx),
+                    repository.log_range(base.clone(), head.clone(), RANGE_LOG_LIMIT, cx),
+                    repository.show_commit(base.clone(), cx),
+                    repository.show_commit(head.clone(), cx),
+                )
+            });
+
+        window.spawn(cx, async move |cx| {
+            let (range_diff, range_log, base_details, head_details) =
+                futures::join!(range_diff, range_log, base_details, head_details);
+            let range_diff = range_diff?;
+            let range = CommitRange {
+                base: base_details?,
+                log: range_log?,
+            };
+            let head_details = head_details?;
+
+            workspace.update_in(cx, |workspace, window, cx| {
+                let project = workspace.project().clone();
+                let workspace_entity = cx.entity();
+                let commit_view = cx.new(|cx| {
+                    CommitView::new(
+                        head_details,
+                        range_diff,
+                        Some(range),
+                        repository,
+                        project,
+                        workspace_entity,
+                        CommitViewOptions::default(),
+                        window,
+                        cx,
+                    )
+                });
+                workspace.active_pane().update(cx, |pane, cx| {
+                    pane.add_item(Box::new(commit_view), true, true, None, window, cx);
+                });
+            })
+        })
+    }
+
     fn new(
         commit: CommitDetails,
         commit_diff: CommitDiff,
+        range: Option<CommitRange>,
         repository: Entity<Repository>,
         project: Entity<Project>,
         workspace: Entity<Workspace>,
@@ -360,7 +442,10 @@ impl CommitView {
 
             editor
         });
-        let commit_sha = Arc::<str>::from(commit.sha.as_ref());
+        let buffer_label: Arc<str> = match &range {
+            Some(range) => range_label(&range.base.sha, &commit.sha).into(),
+            None => short_sha(&commit.sha).into(),
+        };
 
         let repository_clone = repository.clone();
         let project_clone = project.clone();
@@ -390,7 +475,7 @@ impl CommitView {
                     file,
                     &repository_clone,
                     &project_clone,
-                    &commit_sha,
+                    &buffer_label,
                     &language_registry,
                     cx,
                 )
@@ -417,7 +502,7 @@ impl CommitView {
                     file,
                     &repository_clone,
                     &project_clone,
-                    &commit_sha,
+                    &buffer_label,
                     &language_registry,
                     cx,
                 )
@@ -480,6 +565,8 @@ impl CommitView {
             is_shallow_boundary,
             file_filter,
             reveal_file,
+            range,
+            range_expanded: false,
             _load_diff_task: load_diff_task,
         }
     }
@@ -489,7 +576,7 @@ impl CommitView {
         file: CommitFile,
         repository: &Entity<Repository>,
         project: &Entity<Project>,
-        commit_sha: &str,
+        buffer_label: &str,
         language_registry: &Arc<LanguageRegistry>,
         cx: &mut AsyncWindowContext,
     ) -> Result<(BufferId, FileStatus)> {
@@ -511,15 +598,12 @@ impl CommitView {
             })
             .context("project has no worktrees")?;
 
-        let short_sha = commit_sha
-            .get(0..git::SHORT_SHA_LENGTH)
-            .unwrap_or(&commit_sha);
         let file_name = file
             .path
             .file_name()
             .map(|name| name.to_string())
             .unwrap_or_else(|| file.path.display(PathStyle::local()).to_string());
-        let display_name = format!("{short_sha} - {file_name}");
+        let display_name = format!("{buffer_label} - {file_name}");
         let file = Arc::new(GitBlob {
             path: file.path.clone(),
             is_deleted,
@@ -790,18 +874,245 @@ impl CommitView {
 
     fn render_commit_avatar(
         &self,
-        sha: &SharedString,
+        commit: &CommitDetails,
         size: impl Into<gpui::AbsoluteLength>,
         window: &mut Window,
         cx: &mut App,
     ) -> AnyElement {
         CommitAvatar::new(
-            sha,
-            Some(self.commit.author_email.clone()),
+            &commit.sha,
+            Some(commit.author_email.clone()),
             self.remote.as_ref(),
         )
         .size(size)
         .render(window, cx)
+    }
+
+    fn render_range_commit(
+        &self,
+        commit: &CommitDetails,
+        is_base: bool,
+        avatar_column_width: Pixels,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let subject = commit
+            .message
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        let text_color = if is_base {
+            Color::Muted
+        } else {
+            Color::Default
+        };
+        let sha = commit.sha.clone();
+        h_flex()
+            .id(ElementId::Name(format!("range-commit-{sha}").into()))
+            .w_full()
+            .pr_2p5()
+            .rounded_sm()
+            .cursor_pointer()
+            .hover(|style| style.bg(cx.theme().colors().element_hover))
+            .tooltip(Tooltip::text("View Commit"))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                CommitView::open(
+                    sha.to_string(),
+                    this.repository.downgrade(),
+                    this.workspace.clone(),
+                    CommitViewOptions::default(),
+                    window,
+                    cx,
+                );
+            }))
+            .child(
+                h_flex()
+                    .flex_none()
+                    .w(avatar_column_width)
+                    .justify_center()
+                    .child(self.render_commit_avatar(commit, rems_from_px(18_f32), window, cx)),
+            )
+            .child(
+                h_flex()
+                    .min_w_0()
+                    .gap_2()
+                    .child(
+                        Label::new(SharedString::from(short_sha(&commit.sha).to_string()))
+                            .buffer_font(cx)
+                            .size(LabelSize::Small)
+                            .color(if is_base { Color::Muted } else { Color::Accent }),
+                    )
+                    .child(
+                        Label::new(subject)
+                            .size(LabelSize::Small)
+                            .color(text_color)
+                            .truncate(),
+                    ),
+            )
+    }
+
+    fn render_range_header(
+        &self,
+        range: &CommitRange,
+        avatar_column_width: Pixels,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let base_sha = range.base.sha.clone();
+        let head_sha = self.commit.sha.clone();
+        let total_count = range.log.total_count;
+        let loaded_count = range.log.commits.len();
+        let can_collapse = total_count > RANGE_COLLAPSED_COMMIT_COUNT;
+        let is_expanded = self.range_expanded || !can_collapse;
+        let shown_count = if is_expanded {
+            loaded_count
+        } else {
+            loaded_count.min(RANGE_COLLAPSED_COMMIT_COUNT)
+        };
+        let hidden_count = total_count.saturating_sub(shown_count);
+        let range_text = format!("{base_sha}..{head_sha}");
+
+        let clipboard_has_range = cx
+            .read_from_clipboard()
+            .and_then(|entry| entry.text())
+            .is_some_and(|clipboard_text| clipboard_text.trim() == range_text);
+        let (copy_icon, copy_icon_color) = if clipboard_has_range {
+            (IconName::Check, Color::Success)
+        } else {
+            (IconName::Copy, Color::Muted)
+        };
+
+        let commit_count_text = if total_count == 1 {
+            "1 commit".to_string()
+        } else {
+            format!("{total_count} commits")
+        };
+
+        let commits = range.log.commits[..shown_count]
+            .iter()
+            .map(|commit| {
+                self.render_range_commit(commit, false, avatar_column_width, window, cx)
+                    .into_any_element()
+            })
+            .collect::<Vec<_>>();
+        let commit_list = if is_expanded && can_collapse {
+            div()
+                .id("range-commits")
+                .max_h(window.line_height() * 12.)
+                .overflow_y_scroll()
+                .track_scroll(&self.message_scroll_handle)
+                .children(commits)
+                .into_any_element()
+        } else {
+            v_flex().children(commits).into_any_element()
+        };
+
+        let toggle_label = if is_expanded {
+            "Show Fewer Commits".to_string()
+        } else if hidden_count == 1 {
+            "Show 1 More Commit".to_string()
+        } else {
+            format!("Show {hidden_count} More Commits")
+        };
+
+        v_flex()
+            .w_full()
+            .py_2p5()
+            .gap_1()
+            .border_b_1()
+            .border_color(cx.theme().colors().border_variant)
+            .child(
+                h_flex()
+                    .w_full()
+                    .pr_2p5()
+                    .pb_1()
+                    .justify_between()
+                    .child(
+                        h_flex()
+                            .child(h_flex().flex_none().w(avatar_column_width))
+                            .child(
+                                h_flex()
+                                    .gap_1p5()
+                                    .child(
+                                        Label::new(SharedString::from(range_label(
+                                            &base_sha, &head_sha,
+                                        )))
+                                        .buffer_font(cx),
+                                    )
+                                    .child(Label::new("•").color(Color::Muted).alpha(0.5))
+                                    .child(Label::new(commit_count_text).color(Color::Muted)),
+                            ),
+                    )
+                    .child(
+                        Button::new("range", "Commit Range")
+                            .start_icon(
+                                Icon::new(copy_icon)
+                                    .size(IconSize::Small)
+                                    .color(copy_icon_color),
+                            )
+                            .tooltip({
+                                let range_text = SharedString::from(range_text.clone());
+                                move |_, cx| {
+                                    Tooltip::with_meta(
+                                        "Copy Commit Range",
+                                        None,
+                                        range_text.clone(),
+                                        cx,
+                                    )
+                                }
+                            })
+                            .on_click(move |_, _, cx| {
+                                cx.stop_propagation();
+                                cx.write_to_clipboard(ClipboardItem::new_string(
+                                    range_text.clone(),
+                                ));
+                            }),
+                    ),
+            )
+            .child(commit_list)
+            .when(is_expanded && total_count > loaded_count, |this| {
+                let unloaded_count = total_count - loaded_count;
+                this.child(
+                    h_flex()
+                        .child(h_flex().flex_none().w(avatar_column_width))
+                        .child(
+                            Label::new(format!("{unloaded_count} older commits not shown"))
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        ),
+                )
+            })
+            .when(can_collapse, |this| {
+                this.child(
+                    h_flex()
+                        .child(h_flex().flex_none().w(avatar_column_width))
+                        .child(
+                            Button::new("range-commits-toggle", toggle_label)
+                                .label_size(LabelSize::Small)
+                                .color(Color::Muted)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.range_expanded = !this.range_expanded;
+                                    cx.notify();
+                                })),
+                        ),
+                )
+            })
+            .child(
+                h_flex()
+                    .w_full()
+                    .pr_2p5()
+                    .gap_2()
+                    .child(h_flex().flex_none().w(avatar_column_width))
+                    .child(div().flex_1().child(Divider::horizontal_dashed()))
+                    .child(
+                        Label::new("Base, not included")
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(div().flex_1().child(Divider::horizontal_dashed())),
+            )
+            .child(self.render_range_commit(&range.base, true, avatar_column_width, window, cx))
     }
 
     fn calculate_changed_lines(&self, cx: &App) -> (u32, u32) {
@@ -854,7 +1165,7 @@ impl CommitView {
         self.open_file_at_head(&file, window, cx);
     }
 
-    fn render_header(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_header(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let commit = &self.commit;
         let author_name = commit.author_name.clone();
         let author_email = commit.author_email.clone();
@@ -884,6 +1195,12 @@ impl CommitView {
         let avatar_min_side_padding = rems_from_px(6_f32).to_pixels(window.rem_size());
         let avatar_container_min = avatar_size_px + avatar_min_side_padding;
         let avatar_container_width = gutter_width.max(avatar_container_min);
+
+        if let Some(range) = &self.range {
+            return self
+                .render_range_header(range, avatar_container_width, window, cx)
+                .into_any_element();
+        }
 
         let clipboard_has_sha = cx
             .read_from_clipboard()
@@ -926,7 +1243,7 @@ impl CommitView {
                                     .w(avatar_container_width)
                                     .justify_center()
                                     .child(self.render_commit_avatar(
-                                        &commit.sha,
+                                        commit,
                                         avatar_size,
                                         window,
                                         cx,
@@ -1003,6 +1320,7 @@ impl CommitView {
                     }),
             )
             .children(self.render_commit_message(avatar_container_width, window, cx))
+            .into_any_element()
     }
 
     fn render_commit_message(
@@ -1339,12 +1657,24 @@ impl Item for CommitView {
     }
 
     fn tab_content_text(&self, _detail: usize, _cx: &App) -> SharedString {
+        if let Some(range) = &self.range {
+            let label = range_label(&range.base.sha, &self.commit.sha);
+            return match range.log.total_count {
+                1 => format!("{label} (1 commit)").into(),
+                count => format!("{label} ({count} commits)").into(),
+            };
+        }
         let short_sha = self.commit.sha.get(0..7).unwrap_or(&*self.commit.sha);
         let subject = truncate_and_trailoff(self.commit.message.split('\n').next().unwrap(), 20);
         format!("{short_sha} — {subject}").into()
     }
 
     fn tab_tooltip_content(&self, _: &App) -> Option<TabTooltipContent> {
+        if let Some(range) = &self.range {
+            return Some(TabTooltipContent::Text(
+                format!("{}..{}", range.base.sha, self.commit.sha).into(),
+            ));
+        }
         let short_sha = self.commit.sha.get(0..16).unwrap_or(&*self.commit.sha);
         let subject = self.commit.message.split('\n').next().unwrap();
 
@@ -1525,6 +1855,8 @@ impl Item for CommitView {
                 is_shallow_boundary: self.is_shallow_boundary,
                 file_filter: self.file_filter.clone(),
                 reveal_file: self.reveal_file.clone(),
+                range: self.range.clone(),
+                range_expanded: self.range_expanded,
                 _load_diff_task: Task::ready(Ok(())),
             }
         })))
@@ -1571,6 +1903,7 @@ impl Render for CommitViewToolbar {
 
         let commit_view_ref = commit_view.read(cx);
         let is_stash = commit_view_ref.stash.is_some();
+        let is_range = commit_view_ref.range.is_some();
 
         let (additions, deletions) = commit_view_ref.calculate_changed_lines(cx);
 
@@ -1623,7 +1956,7 @@ impl Render for CommitViewToolbar {
                         );
                     }),
             )
-            .when(!is_stash, |this| {
+            .when(!is_stash && !is_range, |this| {
                 this.child(
                     IconButton::new("show-in-git-graph", IconName::GitGraph)
                         .icon_size(IconSize::Small)
@@ -1673,6 +2006,14 @@ impl ToolbarItemView for CommitViewToolbar {
     }
 }
 
+fn short_sha(sha: &str) -> &str {
+    sha.get(..git::SHORT_SHA_LENGTH).unwrap_or(sha)
+}
+
+fn range_label(base: &str, head: &str) -> String {
+    format!("{}..{}", short_sha(base), short_sha(head))
+}
+
 fn stash_matches_index(sha: &str, stash_index: usize, repo: &Repository) -> bool {
     repo.stash_entries
         .entries
@@ -1708,6 +2049,16 @@ mod tests {
     /// Opens a commit view for a commit that modifies `a.txt` and `b.txt`.
     async fn open_test_commit_view(
         file_filter: Option<RepoPath>,
+        cx: &mut TestAppContext,
+    ) -> (Entity<CommitView>, &mut VisualTestContext) {
+        open_test_commit_view_with_range(file_filter, None, cx).await
+    }
+
+    /// Like `open_test_commit_view`, but shows a range ending at the commit
+    /// when `range` is given.
+    async fn open_test_commit_view_with_range(
+        file_filter: Option<RepoPath>,
+        range: Option<CommitRange>,
         cx: &mut TestAppContext,
     ) -> (Entity<CommitView>, &mut VisualTestContext) {
         let fs = FakeFs::new(cx.executor());
@@ -1750,6 +2101,7 @@ mod tests {
                 CommitView::new(
                     commit,
                     commit_diff,
+                    range,
                     repository,
                     project.clone(),
                     workspace_entity,
@@ -1772,6 +2124,65 @@ mod tests {
         });
         cx.run_until_parked();
         (commit_view, cx)
+    }
+
+    #[gpui::test]
+    async fn test_range_view_labels(cx: &mut TestAppContext) {
+        init_test(cx);
+        let base_sha = "fedcba9876543210fedcba9876543210fedcba98";
+        let range = CommitRange {
+            base: CommitDetails {
+                sha: base_sha.into(),
+                message: "Base\n".into(),
+                ..Default::default()
+            },
+            log: RangeLog {
+                commits: (0..RANGE_LOG_LIMIT)
+                    .map(|index| CommitDetails {
+                        sha: format!("{index:040x}").into(),
+                        message: format!("Commit {index}\n").into(),
+                        ..Default::default()
+                    })
+                    .collect(),
+                total_count: RANGE_LOG_LIMIT + 20,
+            },
+        };
+        let (commit_view, cx) = open_test_commit_view_with_range(None, Some(range), cx).await;
+
+        commit_view.update(cx, |commit_view, cx| {
+            assert_eq!(
+                commit_view.tab_content_text(0, cx).as_ref(),
+                format!("fedcba9..0123456 ({} commits)", RANGE_LOG_LIMIT + 20)
+            );
+            assert!(!commit_view.shows_whole_commit());
+            assert_eq!(
+                commit_view
+                    .range_endpoints()
+                    .map(|(base, head)| (base.to_string(), head.to_string())),
+                Some((
+                    base_sha.to_string(),
+                    "0123456789abcdef0123456789abcdef01234567".to_string()
+                ))
+            );
+            let file_names = commit_view
+                .multibuffer
+                .read(cx)
+                .all_buffers()
+                .iter()
+                .filter_map(|buffer| Some(buffer.read(cx).file()?.file_name(cx).to_string()))
+                .collect::<HashSet<_>>();
+            assert_eq!(
+                file_names,
+                HashSet::from_iter([
+                    "fedcba9..0123456 - a.txt".to_string(),
+                    "fedcba9..0123456 - b.txt".to_string(),
+                ])
+            );
+            commit_view.range_expanded = true;
+            cx.notify();
+        });
+        // Draws the expanded header, which lists every loaded commit.
+        cx.run_until_parked();
     }
 
     fn folded_files(commit_view: &CommitView, cx: &App) -> usize {
@@ -2038,6 +2449,7 @@ mod tests {
                 CommitView::new(
                     commit_details,
                     commit_diff,
+                    None,
                     repository,
                     project,
                     workspace_entity,

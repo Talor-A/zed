@@ -534,6 +534,12 @@ pub struct CommitDiff {
     pub is_shallow_boundary: bool,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RangeLog {
+    pub commits: Vec<CommitDetails>,
+    pub total_count: usize,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct FileHistoryChangedFileSets {
     pub file_sets: Vec<Vec<RepoPath>>,
@@ -621,6 +627,106 @@ async fn load_commit_object<R: smol::io::AsyncBufRead + Unpin>(
         Some(_) => Ok(Some(read_commit_blob(stdout, info_line, newline).await?)),
         None => Ok(None),
     }
+}
+
+/// Reads both sides of every blob change in `raw_diff`, the output of a
+/// `--raw -z --no-abbrev` diff.
+async fn load_changed_files(git: &GitBinary, raw_diff: &str) -> Result<Vec<CommitFile>> {
+    let changes = parse_git_diff_raw(raw_diff);
+
+    let mut cat_file_process = git
+        .build_command(&["cat-file", "--batch=%(objectsize)"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("starting git cat-file process")?;
+
+    let mut files = Vec::<CommitFile>::new();
+    let stdin = cat_file_process
+        .stdin
+        .take()
+        .context("git cat-file process has no stdin")?;
+    let stdout = cat_file_process
+        .stdout
+        .take()
+        .context("git cat-file process has no stdout")?;
+    let mut stdin = BufWriter::with_capacity(512, stdin);
+    let mut stdout = BufReader::new(stdout);
+    let mut info_line = String::new();
+    let mut newline = [b'\0'];
+    for change in changes {
+        let change = change?;
+        let path = change.path;
+        // git-show and git-diff-tree output `/`-delimited paths even on Windows.
+        let Some(rel_path) = RelPath::from_unix_str(path).log_err() else {
+            continue;
+        };
+
+        let objects = [change.new_object, change.old_object];
+        let mut has_blobs = false;
+        for object in objects.iter().flatten() {
+            if object.kind == CommitDiffObjectKind::Blob {
+                stdin.write_all(object.oid.as_bytes()).await?;
+                stdin.write_all(b"\n").await?;
+                has_blobs = true;
+            }
+        }
+        if has_blobs {
+            stdin.flush().await?;
+        }
+
+        let [new_object, old_object] = objects;
+        let new_object =
+            load_commit_object(new_object, &mut stdout, &mut info_line, &mut newline).await?;
+        let old_object =
+            load_commit_object(old_object, &mut stdout, &mut info_line, &mut newline).await?;
+        let is_binary = new_object.as_ref().is_some_and(|object| object.is_binary)
+            || old_object.as_ref().is_some_and(|object| object.is_binary);
+        let new_content = new_object.map(|object| object.content);
+        let old_content = old_object.map(|object| object.content);
+
+        files.push(CommitFile {
+            path: RepoPath(Arc::from(rel_path)),
+            old_content,
+            new_content,
+            is_binary,
+        })
+    }
+    Ok(files)
+}
+
+/// Parses `git log -z --format=%H%x00%at%x00%ae%x00%an%x00%B`. `-z` separates
+/// commits with the same NUL that separates fields, and a commit message
+/// can't contain NUL, so every commit is exactly five fields.
+fn parse_range_log(output: &str) -> Result<Vec<CommitDetails>> {
+    const FIELD_COUNT: usize = 5;
+    let output = output.strip_suffix('\0').unwrap_or(output);
+    if output.is_empty() {
+        return Ok(Vec::new());
+    }
+    let fields = output.split('\0').collect::<Vec<_>>();
+    anyhow::ensure!(
+        fields.len() % FIELD_COUNT == 0,
+        "unexpected git log output: {output:?}"
+    );
+    fields
+        .chunks_exact(FIELD_COUNT)
+        .map(|fields| {
+            let [sha, timestamp, author_email, author_name, message] = fields else {
+                anyhow::bail!("unexpected git log output: {output:?}");
+            };
+            Ok(CommitDetails {
+                sha: sha.to_string().into(),
+                message: message.to_string().into(),
+                commit_timestamp: timestamp
+                    .parse()
+                    .with_context(|| format!("invalid commit timestamp {timestamp:?}"))?,
+                author_email: author_email.to_string().into(),
+                author_name: author_name.to_string().into(),
+            })
+        })
+        .collect()
 }
 
 async fn read_shallow_file(shallow_file_path: &Path) -> Result<Option<String>> {
@@ -929,6 +1035,25 @@ pub trait GitRepository: Send + Sync {
         ignore_shallow_boundary: bool,
         cx: AsyncApp,
     ) -> BoxFuture<'_, Result<CommitDiff>>;
+
+    /// Loads the changes from the tree of `base` to the tree of `head`, with
+    /// both sides of each changed file.
+    fn load_range_diff(
+        &self,
+        base: String,
+        head: String,
+        cx: AsyncApp,
+    ) -> BoxFuture<'_, Result<CommitDiff>>;
+
+    /// Lists the newest `limit` commits that are reachable from `head` but
+    /// not from `base`, newest first, along with how many there are in all.
+    fn log_range(
+        &self,
+        base: String,
+        head: String,
+        limit: usize,
+    ) -> BoxFuture<'_, Result<RangeLog>>;
+
     fn blame(
         &self,
         path: RepoPath,
@@ -1478,69 +1603,7 @@ impl GitRepository for RealGitRepository {
             );
 
             let show_stdout = String::from_utf8_lossy(&show_output.stdout);
-            let changes = parse_git_diff_raw(&show_stdout);
-
-            let mut cat_file_process = git
-                .build_command(&["cat-file", "--batch=%(objectsize)"])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .context("starting git cat-file process")?;
-
-            let mut files = Vec::<CommitFile>::new();
-            let stdin = cat_file_process
-                .stdin
-                .take()
-                .context("git cat-file process has no stdin")?;
-            let stdout = cat_file_process
-                .stdout
-                .take()
-                .context("git cat-file process has no stdout")?;
-            let mut stdin = BufWriter::with_capacity(512, stdin);
-            let mut stdout = BufReader::new(stdout);
-            let mut info_line = String::new();
-            let mut newline = [b'\0'];
-            for change in changes {
-                let change = change?;
-                let path = change.path;
-                // git-show outputs `/`-delimited paths even on Windows.
-                let Some(rel_path) = RelPath::from_unix_str(path).log_err() else {
-                    continue;
-                };
-
-                let objects = [change.new_object, change.old_object];
-                let mut has_blobs = false;
-                for object in objects.iter().flatten() {
-                    if object.kind == CommitDiffObjectKind::Blob {
-                        stdin.write_all(object.oid.as_bytes()).await?;
-                        stdin.write_all(b"\n").await?;
-                        has_blobs = true;
-                    }
-                }
-                if has_blobs {
-                    stdin.flush().await?;
-                }
-
-                let [new_object, old_object] = objects;
-                let new_object =
-                    load_commit_object(new_object, &mut stdout, &mut info_line, &mut newline)
-                        .await?;
-                let old_object =
-                    load_commit_object(old_object, &mut stdout, &mut info_line, &mut newline)
-                        .await?;
-                let is_binary = new_object.as_ref().is_some_and(|object| object.is_binary)
-                    || old_object.as_ref().is_some_and(|object| object.is_binary);
-                let new_content = new_object.map(|object| object.content);
-                let old_content = old_object.map(|object| object.content);
-
-                files.push(CommitFile {
-                    path: RepoPath(Arc::from(rel_path)),
-                    old_content,
-                    new_content,
-                    is_binary,
-                })
-            }
+            let files = load_changed_files(&git, &show_stdout).await?;
 
             Ok(CommitDiff {
                 files,
@@ -1548,6 +1611,101 @@ impl GitRepository for RealGitRepository {
             })
         })
         .boxed()
+    }
+
+    fn load_range_diff(
+        &self,
+        base: String,
+        head: String,
+        cx: AsyncApp,
+    ) -> BoxFuture<'_, Result<CommitDiff>> {
+        let git = self.git_binary();
+        cx.background_spawn(async move {
+            let diff_output = git
+                .build_command(&[
+                    "diff-tree",
+                    "-r",
+                    "-z",
+                    "--raw",
+                    "--no-abbrev",
+                    "--no-renames",
+                    &base,
+                    &head,
+                    "--",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .await
+                .context("starting git diff-tree process")?;
+            anyhow::ensure!(
+                diff_output.status.success(),
+                "git diff-tree failed: {}",
+                String::from_utf8_lossy(&diff_output.stderr)
+            );
+
+            let diff_stdout = String::from_utf8_lossy(&diff_output.stdout);
+            let files = load_changed_files(&git, &diff_stdout).await?;
+
+            Ok(CommitDiff {
+                files,
+                is_shallow_boundary: false,
+            })
+        })
+        .boxed()
+    }
+
+    fn log_range(
+        &self,
+        base: String,
+        head: String,
+        limit: usize,
+    ) -> BoxFuture<'_, Result<RangeLog>> {
+        let git = self.git_binary();
+        self.executor
+            .spawn(async move {
+                let range = format!("{base}..{head}");
+                let count_output = git
+                    .build_command(&["rev-list", "--count", &range, "--"])
+                    .output()
+                    .await?;
+                anyhow::ensure!(
+                    count_output.status.success(),
+                    "git rev-list failed: {}",
+                    String::from_utf8_lossy(&count_output.stderr)
+                );
+                let total_count = std::str::from_utf8(&count_output.stdout)?
+                    .trim()
+                    .parse()
+                    .context("parsing git rev-list --count output")?;
+
+                let max_count = format!("--max-count={limit}");
+                let log_output = git
+                    .build_command(&[
+                        "log",
+                        "-z",
+                        "--topo-order",
+                        &max_count,
+                        "--format=%H%x00%at%x00%ae%x00%an%x00%B",
+                        &range,
+                        "--",
+                    ])
+                    .output()
+                    .await?;
+                anyhow::ensure!(
+                    log_output.status.success(),
+                    "git log failed: {}",
+                    String::from_utf8_lossy(&log_output.stderr)
+                );
+                let commits = parse_range_log(std::str::from_utf8(&log_output.stdout)?)?;
+
+                Ok(RangeLog {
+                    commits,
+                    total_count,
+                })
+            })
+            .boxed()
     }
 
     fn reset(
@@ -4714,6 +4872,119 @@ mod tests {
         );
         assert_eq!(file.new_content.as_deref(), Some(b"target".as_slice()));
         assert_eq!(file.status(), CommitFileStatus::Modified);
+    }
+
+    #[gpui::test]
+    async fn test_load_range_diff_and_log_range(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let repo_dir = tempfile::tempdir().expect("failed to create temporary repository");
+        git_init_repo(repo_dir.path());
+        fs::write(repo_dir.path().join("kept.txt"), "base\n").expect("failed to write file");
+        fs::write(repo_dir.path().join("removed.txt"), "gone\n").expect("failed to write file");
+        git_command(repo_dir.path(), ["add", "."]);
+        git_command(repo_dir.path(), ["commit", "-m", "base"]);
+        let base = git_command_output(repo_dir.path(), ["rev-parse", "HEAD"]);
+
+        fs::write(repo_dir.path().join("kept.txt"), "first\n").expect("failed to write file");
+        fs::write(repo_dir.path().join("added.txt"), "new\n").expect("failed to write file");
+        git_command(repo_dir.path(), ["add", "."]);
+        git_command(repo_dir.path(), ["commit", "-m", "first\n\nWith a body."]);
+
+        fs::write(repo_dir.path().join("kept.txt"), "second\n").expect("failed to write file");
+        fs::remove_file(repo_dir.path().join("removed.txt")).expect("failed to remove file");
+        git_command(repo_dir.path(), ["add", "-A"]);
+        git_command(repo_dir.path(), ["commit", "-m", "second"]);
+        let head = git_command_output(repo_dir.path(), ["rev-parse", "HEAD"]);
+
+        let repository = RealGitRepository::new(
+            &repo_dir.path().join(".git"),
+            None,
+            Some("git".into()),
+            cx.executor(),
+        )
+        .expect("failed to open repository");
+
+        let range_diff = repository
+            .load_range_diff(base.clone(), head.clone(), cx.to_async())
+            .await
+            .expect("failed to load range diff");
+        let files = range_diff
+            .files
+            .iter()
+            .map(|file| {
+                (
+                    file.path.as_unix_str(),
+                    file.old_content.as_deref(),
+                    file.new_content.as_deref(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            files,
+            vec![
+                ("added.txt", None, Some(b"new\n".as_slice())),
+                (
+                    "kept.txt",
+                    Some(b"base\n".as_slice()),
+                    Some(b"second\n".as_slice())
+                ),
+                ("removed.txt", Some(b"gone\n".as_slice()), None),
+            ]
+        );
+
+        let range_log = repository
+            .log_range(base.clone(), head.clone(), 10)
+            .await
+            .expect("failed to log range");
+        assert_eq!(range_log.total_count, 2);
+        assert_eq!(
+            range_log
+                .commits
+                .iter()
+                .map(|commit| commit.message.as_ref())
+                .collect::<Vec<_>>(),
+            vec!["second\n", "first\n\nWith a body.\n"]
+        );
+        assert_eq!(range_log.commits[0].sha.as_ref(), head);
+
+        let limited_log = repository
+            .log_range(base, head, 1)
+            .await
+            .expect("failed to log limited range");
+        assert_eq!(limited_log.total_count, 2);
+        assert_eq!(limited_log.commits.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_range_log() {
+        assert_eq!(parse_range_log("").unwrap(), Vec::new());
+        let commits = parse_range_log(
+            "aaa\x001700000000\x00a@example.com\x00A\x00subject\n\nbody\n\x00\
+             bbb\x001600000000\x00b@example.com\x00B\x00other\n\x00",
+        )
+        .unwrap();
+        assert_eq!(
+            commits,
+            vec![
+                CommitDetails {
+                    sha: "aaa".into(),
+                    message: "subject\n\nbody\n".into(),
+                    commit_timestamp: 1700000000,
+                    author_email: "a@example.com".into(),
+                    author_name: "A".into(),
+                },
+                CommitDetails {
+                    sha: "bbb".into(),
+                    message: "other\n".into(),
+                    commit_timestamp: 1600000000,
+                    author_email: "b@example.com".into(),
+                    author_name: "B".into(),
+                },
+            ]
+        );
+        assert!(parse_range_log("aaa\x001700000000\x00a@example.com\x00").is_err());
     }
 
     #[gpui::test]
