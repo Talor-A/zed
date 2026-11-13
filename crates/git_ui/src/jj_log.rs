@@ -1,4 +1,4 @@
-use crate::{commit_view::CommitView, picker_prompt};
+use crate::{commit_view::CommitView, picker_prompt, project_diff::ProjectDiff};
 use anyhow::{Context as _, Result, anyhow};
 use collections::HashMap;
 use editor::Editor;
@@ -33,7 +33,7 @@ pub(crate) const CUSTOM_JJ_COMMANDS_DOCS_SLUG: &str = "tasks#custom-jj-commands"
 
 const FIELD_SEPARATOR: char = '\u{1f}';
 const MARKER_END: char = '\u{1e}';
-const MARKER_FIELD_COUNT: usize = 8;
+const MARKER_FIELD_COUNT: usize = 9;
 
 // Prefixed to the user's own `templates.log` so every revision's first line
 // carries its identity. The log view strips it back out before rendering.
@@ -45,6 +45,7 @@ const MARKER_TEMPLATE: &str = concat!(
     r#" ++ "\x1f" ++ if(current_working_copy, "1")"#,
     r#" ++ "\x1f" ++ if(divergent, "1")"#,
     r#" ++ "\x1f" ++ if(immutable, "1")"#,
+    r#" ++ "\x1f" ++ parents.len()"#,
     r#" ++ "\x1f" ++ local_bookmarks.map(|b| b.name()).join(" ")"#,
     r#" ++ "\x1e""#,
 );
@@ -305,6 +306,7 @@ struct Revision {
     is_working_copy: bool,
     is_divergent: bool,
     is_immutable: bool,
+    parent_count: usize,
     bookmarks: Vec<String>,
     first_line: usize,
 }
@@ -385,6 +387,7 @@ fn parse_marker(marker: &str, first_line: usize) -> Option<Revision> {
         is_working_copy,
         is_divergent,
         is_immutable,
+        parent_count,
         bookmarks,
     ] = <[&str; MARKER_FIELD_COUNT]>::try_from(fields).ok()?;
     Some(Revision {
@@ -395,6 +398,9 @@ fn parse_marker(marker: &str, first_line: usize) -> Option<Revision> {
         is_working_copy: !is_working_copy.is_empty(),
         is_divergent: !is_divergent.is_empty(),
         is_immutable: !is_immutable.is_empty(),
+        // An unreadable count is treated as zero parents, which keeps the
+        // diff action on the read-only commit view.
+        parent_count: parent_count.parse().unwrap_or(0),
         bookmarks: bookmarks
             .split_whitespace()
             .map(ToString::to_string)
@@ -1230,6 +1236,24 @@ impl JjLog {
             );
             return;
         };
+        // In a colocated repository jj points git's HEAD at `@-` and keeps the
+        // index matching it, so git's uncommitted changes are exactly `@`'s
+        // changes, shown on the real, editable files. With several parents,
+        // HEAD can only name one of them, so merges keep the commit view.
+        if revision.is_working_copy && revision.parent_count == 1 {
+            repository.update(cx, |repository, cx| repository.set_as_active_repository(cx));
+            let workspace = self.workspace.clone();
+            // Adding a tab reads every item in the pane, this log included,
+            // which panics while this log is still being updated.
+            window.defer(cx, move |window, cx| {
+                workspace
+                    .update(cx, |workspace, cx| {
+                        ProjectDiff::deploy_at(workspace, None, window, cx);
+                    })
+                    .log_err();
+            });
+            return;
+        }
         CommitView::open(
             revision.commit_id,
             repository.downgrade(),
@@ -1596,17 +1620,22 @@ impl JjLog {
         cx: &mut Context<Self>,
     ) {
         let (task_source_kind, resolved_task) = command;
-        self.workspace
-            .update(cx, |workspace, cx| {
-                workspace.schedule_resolved_task(
-                    task_source_kind,
-                    resolved_task,
-                    false,
-                    window,
-                    cx,
-                );
-            })
-            .log_err();
+        let workspace = self.workspace.clone();
+        // A task revealed in the center pane adds a tab next to this log,
+        // which reads this log and panics while it is still being updated.
+        window.defer(cx, move |window, cx| {
+            workspace
+                .update(cx, |workspace, cx| {
+                    workspace.schedule_resolved_task(
+                        task_source_kind,
+                        resolved_task,
+                        false,
+                        window,
+                        cx,
+                    );
+                })
+                .log_err();
+        });
     }
 
     fn run_custom_command(&mut self, _: &RunCommand, window: &mut Window, cx: &mut Context<Self>) {
@@ -2331,9 +2360,9 @@ mod tests {
     #[test]
     fn test_parse_log_output_assigns_lines_to_revisions() {
         let output = concat!(
-            "\x1b[1m\x1b[38;5;2m@\x1b[0m  \x1f\x1b[38;5;5mvxqo\x1b[39m\x1f\x1b[1mv\x1b[0m\x1fcdae\x1fc\x1f1\x1f\x1f\x1f\x1evxqopwrx me\n",
+            "\x1b[1m\x1b[38;5;2m@\x1b[0m  \x1f\x1b[38;5;5mvxqo\x1b[39m\x1f\x1b[1mv\x1b[0m\x1fcdae\x1fc\x1f1\x1f\x1f\x1f1\x1f\x1evxqopwrx me\n",
             "│  (no description set)\n",
-            "◆  \x1fuzqr\x1fu\x1f8e47\x1f8\x1f\x1f\x1f1\x1fmain feature\x1euzqrlmow main\n",
+            "◆  \x1fuzqr\x1fu\x1f8e47\x1f8\x1f\x1f\x1f1\x1f2\x1fmain feature\x1euzqrlmow main\n",
             "│  gpui: a commit\n",
             "~\n",
         );
@@ -2363,6 +2392,7 @@ mod tests {
                     is_working_copy: true,
                     is_divergent: false,
                     is_immutable: false,
+                    parent_count: 1,
                     bookmarks: Vec::new(),
                     first_line: 0,
                 },
@@ -2374,6 +2404,7 @@ mod tests {
                     is_working_copy: false,
                     is_divergent: false,
                     is_immutable: true,
+                    parent_count: 2,
                     bookmarks: vec!["main".into(), "feature".into()],
                     first_line: 2,
                 },
@@ -2384,8 +2415,15 @@ mod tests {
 
     #[test]
     fn test_divergent_revision_uses_commit_id() {
-        let revision = parse_marker("x\x1fx\x1fabc\x1fa\x1f\x1f1\x1f\x1f", 0).unwrap();
+        let revision = parse_marker("x\x1fx\x1fabc\x1fa\x1f\x1f1\x1f\x1f1\x1f", 0).unwrap();
         assert_eq!(revision.revset(), "abc");
         assert_eq!(revision.short_id(), "a");
+    }
+
+    #[test]
+    fn test_unreadable_parent_count_is_zero() {
+        let revision = parse_marker("x\x1fx\x1fabc\x1fa\x1f1\x1f\x1f\x1fmany\x1f", 0).unwrap();
+        assert_eq!(revision.parent_count, 0);
+        assert!(parse_marker("x\x1fx\x1fabc\x1fa\x1f1\x1f\x1f\x1f", 0).is_none());
     }
 }
