@@ -6,7 +6,7 @@ use editor::{
     SelectionEffects, SplittableEditor,
     display_map::{Block, DisplayRow, ToDisplayPoint},
     hover_markdown_style, multibuffer_context_lines,
-    scroll::ScrollAnchor,
+    scroll::{ScrollAnchor, ScrollOffset},
 };
 use futures_lite::future::yield_now;
 use git::repository::{CommitDetails, RangeLog, RepoPath};
@@ -35,7 +35,7 @@ use settings::{DiffViewStyle, Settings};
 use std::{
     any::{Any, TypeId},
     collections::HashSet,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
 };
 use theme::ActiveTheme;
@@ -50,6 +50,7 @@ use workspace::{
 
 use crate::commit_tooltip::CommitAvatar;
 use crate::git_panel::GitPanel;
+use crate::jj_log::{RevisionCommand, edit_at_position};
 
 actions!(
     git,
@@ -116,6 +117,92 @@ pub(crate) struct GitBlob {
     pub(crate) is_deleted: bool,
     pub(crate) is_binary: bool,
     pub(crate) display_name: String,
+    /// The full SHA of the commit this file's contents come from.
+    pub(crate) revision: SharedString,
+    /// The working directory of the repository `path` is relative to.
+    pub(crate) work_directory: Arc<Path>,
+}
+
+/// The position under the cursor in a file as it was at a commit, read from
+/// a read-only view of that commit.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct RevisionPosition {
+    /// The full SHA of the commit.
+    pub(crate) revision: SharedString,
+    pub(crate) work_directory: Arc<Path>,
+    pub(crate) path: RepoPath,
+    pub(crate) point: language::Point,
+    /// How far below the top of the view the cursor sits, in lines.
+    pub(crate) line_offset_from_top: ScrollOffset,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum RevisionPositionError {
+    OldSide,
+    NotAtRevision,
+    Deleted,
+    Binary,
+}
+
+impl RevisionPositionError {
+    pub(crate) fn message(self) -> &'static str {
+        match self {
+            RevisionPositionError::OldSide => {
+                "Only the new side of a diff can be opened for editing"
+            }
+            RevisionPositionError::NotAtRevision => "The cursor isn't in a file at a revision",
+            RevisionPositionError::Deleted => "This file doesn't exist at this revision",
+            RevisionPositionError::Binary => "Binary files can't be opened for editing",
+        }
+    }
+}
+
+/// Reads the position under the newest cursor of `editor`, which must be in a
+/// buffer loaded from a commit, such as a commit view's or a blob tab's.
+pub(crate) fn revision_position_in_editor(
+    editor: &Entity<Editor>,
+    cx: &mut App,
+) -> Result<RevisionPosition, RevisionPositionError> {
+    editor.update(cx, |editor, cx| {
+        let head = editor.selections.newest_anchor().head();
+        let multibuffer_snapshot = editor.buffer().read(cx).snapshot(cx);
+        let (text_anchor, buffer_snapshot) = multibuffer_snapshot
+            .anchor_to_buffer_anchor(head)
+            .ok_or(RevisionPositionError::NotAtRevision)?;
+        let blob = buffer_snapshot
+            .file()
+            .and_then(|file| {
+                let file: &dyn Any = file.as_ref();
+                file.downcast_ref::<GitBlob>()
+            })
+            .ok_or(RevisionPositionError::NotAtRevision)?;
+        if blob.is_binary {
+            return Err(RevisionPositionError::Binary);
+        }
+        if blob.is_deleted {
+            return Err(RevisionPositionError::Deleted);
+        }
+        let point = language::ToPoint::to_point(&text_anchor, buffer_snapshot);
+        let position = RevisionPosition {
+            revision: blob.revision.clone(),
+            work_directory: blob.work_directory.clone(),
+            path: blob.path.clone(),
+            point,
+            line_offset_from_top: 0.,
+        };
+
+        let display_snapshot = editor.display_snapshot(cx);
+        let cursor_row = head.to_display_point(&display_snapshot).row().as_f64();
+        let line_offset_from_top = cursor_row - editor.scroll_position(cx).y;
+        let visible_line_count = editor.visible_line_count().unwrap_or(0.);
+        // A cursor outside the viewport, such as one just moved by a header
+        // menu, goes to the top of the opened file's view.
+        let is_visible = (0.0..visible_line_count).contains(&line_offset_from_top);
+        Ok(RevisionPosition {
+            line_offset_from_top: if is_visible { line_offset_from_top } else { 0. },
+            ..position
+        })
+    })
 }
 
 pub(crate) fn worktree_id_for_repo_path(
@@ -182,7 +269,23 @@ impl Addon for CommitDiffAddon {
             exists_at_head.then(|| file.clone())
         });
 
-        menu.when_some(file_to_open, |menu, file| {
+        let buffer_id = buffer.remote_id();
+        // The header belongs to the new side, so use it whichever side of a
+        // split view was focused last.
+        let revision_entry = |menu: ContextMenu,
+                              label: &'static str,
+                              action: Box<dyn gpui::Action>,
+                              command: RevisionCommand| {
+            let commit_view = self.commit_view.clone();
+            menu.entry(label, Some(action), move |window, cx| {
+                commit_view
+                    .update(cx, |view, cx| {
+                        view.edit_at_revision_in_buffer(buffer_id, command, window, cx)
+                    })
+                    .log_err();
+            })
+        };
+        let menu = menu.when_some(file_to_open, |menu, file| {
             let commit_view = self.commit_view.clone();
             menu.entry(
                 "Open File in Project",
@@ -193,7 +296,19 @@ impl Addon for CommitDiffAddon {
                         .log_err();
                 },
             )
-        })
+        });
+        let menu = revision_entry(
+            menu,
+            "New Change at This Revision (jj new)",
+            Box::new(crate::jj_log::jj::NewAtRevision),
+            RevisionCommand::New,
+        );
+        revision_entry(
+            menu,
+            "Edit This Revision (jj edit)",
+            Box::new(crate::jj_log::jj::EditRevision),
+            RevisionCommand::Edit,
+        )
     }
 }
 
@@ -248,6 +363,58 @@ impl CommitView {
 
     pub(crate) fn repository(&self) -> &Entity<Repository> {
         &self.repository
+    }
+
+    /// Runs `command` from a file header's menu. Unless the cursor is already in
+    /// that file, it first moves to the start of the file's first hunk.
+    fn edit_at_revision_in_buffer(
+        &mut self,
+        buffer_id: BufferId,
+        command: RevisionCommand,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let rhs_editor = self.editor.read(cx).rhs_editor().clone();
+        rhs_editor.update(cx, |editor, cx| {
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let head = editor.selections.newest_anchor().head();
+            let cursor_in_buffer = snapshot
+                .anchor_to_buffer_anchor(head)
+                .is_some_and(|(anchor, _)| anchor.buffer_id == buffer_id);
+            if cursor_in_buffer {
+                return;
+            }
+            let Some(start) = snapshot
+                .excerpts_for_buffer(buffer_id)
+                .next()
+                .and_then(|excerpt| snapshot.anchor_in_buffer(excerpt.primary.start))
+            else {
+                return;
+            };
+            editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+                selections.select_anchor_ranges([start..start])
+            });
+        });
+        let position = revision_position_in_editor(&rhs_editor, cx);
+        self.workspace
+            .update(cx, |workspace, cx| {
+                edit_at_position(workspace, command, position, None, window, cx)
+            })
+            .log_err();
+    }
+
+    /// The position under the cursor on the new side of the diff: the commit,
+    /// or the head of the range.
+    pub(crate) fn revision_position(
+        &self,
+        cx: &mut App,
+    ) -> Result<RevisionPosition, RevisionPositionError> {
+        let editor = self.editor.read(cx);
+        if editor.focused_editor() != editor.rhs_editor() {
+            return Err(RevisionPositionError::OldSide);
+        }
+        let rhs_editor = editor.rhs_editor().clone();
+        revision_position_in_editor(&rhs_editor, cx)
     }
 
     fn open_with_options(
@@ -442,6 +609,7 @@ impl CommitView {
 
             editor
         });
+        let revision = commit.sha.clone();
         let buffer_label: Arc<str> = match &range {
             Some(range) => range_label(&range.base.sha, &commit.sha).into(),
             None => short_sha(&commit.sha).into(),
@@ -475,6 +643,7 @@ impl CommitView {
                     file,
                     &repository_clone,
                     &project_clone,
+                    &revision,
                     &buffer_label,
                     &language_registry,
                     cx,
@@ -502,6 +671,7 @@ impl CommitView {
                     file,
                     &repository_clone,
                     &project_clone,
+                    &revision,
                     &buffer_label,
                     &language_registry,
                     cx,
@@ -576,6 +746,7 @@ impl CommitView {
         file: CommitFile,
         repository: &Entity<Repository>,
         project: &Entity<Project>,
+        revision: &SharedString,
         buffer_label: &str,
         language_registry: &Arc<LanguageRegistry>,
         cx: &mut AsyncWindowContext,
@@ -592,11 +763,13 @@ impl CommitView {
             raw_new_text
         };
 
-        let worktree_id = repository
-            .read_with(cx, |repository, cx| {
-                worktree_id_for_repo_path(repository, project.read(cx), &file.path, cx)
-            })
-            .context("project has no worktrees")?;
+        let (worktree_id, work_directory) = repository.read_with(cx, |repository, cx| {
+            (
+                worktree_id_for_repo_path(repository, project.read(cx), &file.path, cx),
+                repository.work_directory_abs_path.clone(),
+            )
+        });
+        let worktree_id = worktree_id.context("project has no worktrees")?;
 
         let file_name = file
             .path
@@ -610,6 +783,8 @@ impl CommitView {
             is_binary,
             worktree_id,
             display_name,
+            revision: revision.clone(),
+            work_directory,
         }) as Arc<dyn language::File>;
 
         let buffer = build_buffer(new_text, file, language_registry, cx).await?;
@@ -2197,6 +2372,78 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_revision_position_reads_new_side_under_cursor(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (commit_view, cx) = open_test_commit_view(None, cx).await;
+
+        for path in ["b.txt", "a.txt"] {
+            select_first_hunk(&commit_view, path, cx);
+            let position = commit_view
+                .update(cx, |commit_view, cx| commit_view.revision_position(cx))
+                .expect("cursor should be in a file at the commit");
+            assert_eq!(
+                position.revision.as_ref(),
+                "0123456789abcdef0123456789abcdef01234567"
+            );
+            assert_eq!(&*position.work_directory, Path::new(path!("/project")));
+            assert_eq!(position.path, RepoPath::new(path).unwrap());
+            assert_eq!(position.point, language::Point::new(0, 0));
+        }
+    }
+
+    fn select_first_hunk(commit_view: &Entity<CommitView>, path: &str, cx: &mut VisualTestContext) {
+        let buffer_id = commit_view.read_with(cx, |commit_view, cx| {
+            commit_view
+                .multibuffer
+                .read(cx)
+                .all_buffers()
+                .into_iter()
+                .find(|buffer| {
+                    buffer
+                        .read(cx)
+                        .file()
+                        .is_some_and(|file| file.path().as_unix_str() == path)
+                })
+                .map(|buffer| buffer.read(cx).remote_id())
+                .expect("file should be in the commit view")
+        });
+        let rhs_editor = commit_view.read_with(cx, |commit_view, cx| {
+            commit_view.editor.read(cx).rhs_editor().clone()
+        });
+        rhs_editor.update_in(cx, |editor, window, cx| {
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let start = snapshot
+                .excerpts_for_buffer(buffer_id)
+                .next()
+                .and_then(|excerpt| snapshot.anchor_in_buffer(excerpt.primary.start))
+                .expect("file should have an excerpt");
+            editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+                selections.select_anchor_ranges([start..start])
+            });
+        });
+    }
+
+    #[gpui::test]
+    async fn test_range_view_revision_position_uses_head(cx: &mut TestAppContext) {
+        init_test(cx);
+        let range = CommitRange {
+            base: CommitDetails {
+                sha: "fedcba9876543210fedcba9876543210fedcba98".into(),
+                ..Default::default()
+            },
+            log: RangeLog::default(),
+        };
+        let (commit_view, cx) = open_test_commit_view_with_range(None, Some(range), cx).await;
+        let position = commit_view
+            .update(cx, |commit_view, cx| commit_view.revision_position(cx))
+            .expect("cursor should be in a file at the head");
+        assert_eq!(
+            position.revision.as_ref(),
+            "0123456789abcdef0123456789abcdef01234567"
+        );
+    }
+
+    #[gpui::test]
     async fn test_commit_view_opens_with_defaults(cx: &mut TestAppContext) {
         init_test(cx);
         let (commit_view, cx) = open_test_commit_view(None, cx).await;
@@ -2284,6 +2531,8 @@ mod tests {
             is_deleted: false,
             is_binary: false,
             display_name: "abc1234 - notes.md".into(),
+            revision: "abc1234".into(),
+            work_directory: Path::new(path!("/project")).into(),
         }) as Arc<dyn File>;
 
         let buffer = build_buffer(text, blob, &language_registry, &mut async_cx)
@@ -2349,6 +2598,8 @@ mod tests {
                     is_deleted: false,
                     is_binary: false,
                     display_name: display_name.to_string(),
+                    revision: "abc1234".into(),
+                    work_directory: Path::new(path!("/project")).into(),
                 }) as Arc<dyn File>;
                 assert_eq!(blob.file_system_abs_path(cx), None);
                 language_registry

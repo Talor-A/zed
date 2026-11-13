@@ -699,12 +699,17 @@ fn open_buffer_blame_at_revision(
                     })
                     .await?;
 
+                let work_directory = repository.read_with(cx, |repository, _| {
+                    repository.work_directory_abs_path.clone()
+                });
                 let file = Arc::new(GitBlob {
                     path: path.clone(),
                     worktree_id,
                     is_deleted: false,
                     is_binary: false,
                     display_name: display_name.clone(),
+                    revision: revision.to_string().into(),
+                    work_directory,
                 }) as Arc<dyn language::File>;
 
                 let buffer = build_buffer(content, file, &language_registry, cx).await?;

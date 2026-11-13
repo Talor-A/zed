@@ -1,16 +1,21 @@
 use crate::{
-    branch_diff::BranchDiff, commit_view::CommitView, picker_prompt, project_diff::ProjectDiff,
+    branch_diff::BranchDiff,
+    commit_view::{
+        CommitView, RevisionPosition, RevisionPositionError, revision_position_in_editor,
+    },
+    picker_prompt,
+    project_diff::ProjectDiff,
 };
 use anyhow::{Context as _, Result, anyhow};
-use collections::HashMap;
-use editor::Editor;
+use collections::{HashMap, HashSet};
+use editor::{Editor, SelectionEffects, scroll::Autoscroll};
 use futures::{StreamExt as _, channel::oneshot, future::Shared};
 use fuzzy::{StringMatch, StringMatchCandidate};
 use gpui::{
-    App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, Font, FontFeatures,
-    FontStyle, FontWeight, HighlightStyle, Hsla, KeyContext, ScrollStrategy, SharedString,
-    StyledText, Subscription, Task, UnderlineStyle, UniformListScrollHandle, WeakEntity, Window,
-    actions, canvas, uniform_list,
+    App, Context, DismissEvent, Entity, EntityId, EventEmitter, FocusHandle, Focusable, Font,
+    FontFeatures, FontStyle, FontWeight, HighlightStyle, Hsla, KeyContext, ScrollStrategy,
+    SharedString, StyledText, Subscription, Task, UnderlineStyle, UniformListScrollHandle,
+    WeakEntity, Window, actions, canvas, uniform_list,
 };
 use notifications::status_toast::StatusToast;
 use picker::{Picker, PickerDelegate};
@@ -26,7 +31,7 @@ use task::{Shell, TaskContext, TaskVariables, VariableName};
 use terminal::terminal_settings::TerminalSettings;
 use theme_settings::ThemeSettings;
 use ui::{HighlightedLabel, KeyBinding, ListItem, ListItemSpacing, prelude::*};
-use util::ResultExt as _;
+use util::{ResultExt as _, paths::PathStyle};
 use workspace::{
     ModalView, Workspace,
     item::{Item, ItemEvent},
@@ -55,6 +60,24 @@ const MARKER_TEMPLATE: &str = concat!(
     r#" ++ "\x1f" ++ if(conflict, "1")"#,
     r#" ++ "\x1e""#,
 );
+
+pub mod jj {
+    use gpui::actions;
+
+    actions!(
+        jj,
+        [
+            /// Runs `jj new` on the revision of the file under the cursor in a
+            /// commit view or a file at a revision, then opens that file for
+            /// editing at the same position.
+            NewAtRevision,
+            /// Runs `jj edit` on the revision of the file under the cursor in a
+            /// commit view or a file at a revision, then opens that file for
+            /// editing at the same position.
+            EditRevision,
+        ]
+    );
+}
 
 actions!(
     jj_log,
@@ -148,6 +171,12 @@ pub fn init(cx: &mut App) {
     cx.observe_new(|workspace: &mut Workspace, _, _| {
         workspace.register_action(|workspace, _: &Open, window, cx| {
             open(workspace, window, cx);
+        });
+        workspace.register_action(|workspace, _: &jj::NewAtRevision, window, cx| {
+            edit_at_revision(workspace, RevisionCommand::New, window, cx);
+        });
+        workspace.register_action(|workspace, _: &jj::EditRevision, window, cx| {
+            edit_at_revision(workspace, RevisionCommand::Edit, window, cx);
         });
     })
     .detach();
@@ -837,30 +866,13 @@ impl JjLog {
     /// whole error in a toast like the one git commands use.
     fn report_error(&mut self, operation: String, error: anyhow::Error, cx: &mut Context<Self>) {
         let message = plain_error_text(&error);
-        let summary = error_summary(&message);
-        self.set_status(summary.clone(), true, cx);
+        self.set_status(error_summary(&message), true, cx);
         let Some(workspace) = self.workspace.upgrade() else {
             return;
         };
         cx.defer(move |cx| {
             workspace.update(cx, |workspace, cx| {
-                let workspace_handle = cx.weak_entity();
-                let title = format!("jj {operation} failed: {summary}");
-                let toast = StatusToast::new(title, cx, |this, _| {
-                    this.icon(
-                        Icon::new(IconName::XCircle)
-                            .size(IconSize::Small)
-                            .color(Color::Error),
-                    )
-                    .action("View Log", move |window, cx| {
-                        workspace_handle
-                            .update(cx, |workspace, cx| {
-                                open_error_output(&operation, &message, workspace, window, cx)
-                            })
-                            .log_err();
-                    })
-                });
-                workspace.toggle_status_toast(toast, cx);
+                show_jj_error(workspace, operation, &error, cx);
             });
         });
     }
@@ -2294,6 +2306,288 @@ fn parse_range_query(output: &str) -> Result<std::result::Result<SelectedRange, 
     }))
 }
 
+/// Shows a failed jj command's first line in a toast, with the whole error a
+/// click away.
+fn show_jj_error(
+    workspace: &mut Workspace,
+    operation: String,
+    error: &anyhow::Error,
+    cx: &mut Context<Workspace>,
+) {
+    let message = plain_error_text(error);
+    let summary = error_summary(&message);
+    let workspace_handle = cx.weak_entity();
+    let title = format!("jj {operation} failed: {summary}");
+    let toast = StatusToast::new(title, cx, |this, _| {
+        this.icon(
+            Icon::new(IconName::XCircle)
+                .size(IconSize::Small)
+                .color(Color::Error),
+        )
+        .action("View Log", move |window, cx| {
+            workspace_handle
+                .update(cx, |workspace, cx| {
+                    open_error_output(&operation, &message, workspace, window, cx)
+                })
+                .log_err();
+        })
+    });
+    workspace.toggle_status_toast(toast, cx);
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum RevisionCommand {
+    New,
+    Edit,
+}
+
+impl RevisionCommand {
+    fn name(self) -> &'static str {
+        match self {
+            RevisionCommand::New => "new",
+            RevisionCommand::Edit => "edit",
+        }
+    }
+}
+
+const REVISION_STATE_TEMPLATE: &str =
+    r#"if(hidden, "1") ++ "\x1f" ++ if(current_working_copy, "1") ++ "\n""#;
+
+#[derive(Debug, PartialEq)]
+struct RevisionState {
+    is_hidden: bool,
+    is_working_copy: bool,
+}
+
+fn parse_revision_state(output: &str) -> Result<RevisionState> {
+    let line = output.trim_end_matches('\n');
+    let (is_hidden, is_working_copy) = line
+        .split_once(FIELD_SEPARATOR)
+        .filter(|(_, is_working_copy)| !is_working_copy.contains(['\n', FIELD_SEPARATOR]))
+        .with_context(|| format!("unexpected jj log output: {output:?}"))?;
+    Ok(RevisionState {
+        is_hidden: !is_hidden.is_empty(),
+        is_working_copy: !is_working_copy.is_empty(),
+    })
+}
+
+/// Makes the revision of the file under the cursor editable with `jj new` or
+/// `jj edit`, then opens the working-copy file at the same position. Works in
+/// commit and range views, where it uses the new side, and in tabs that show
+/// one file at a revision, which the opened file replaces.
+fn edit_at_revision(
+    workspace: &mut Workspace,
+    command: RevisionCommand,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let Some(active_item) = workspace.active_item(cx) else {
+        return;
+    };
+    let (position, replaced_item) = if let Some(commit_view) = active_item.downcast::<CommitView>()
+    {
+        (
+            commit_view.update(cx, |commit_view, cx| commit_view.revision_position(cx)),
+            None,
+        )
+    } else if let Some(editor) = active_item.act_as::<Editor>(cx) {
+        (
+            revision_position_in_editor(&editor, cx),
+            Some(active_item.item_id()),
+        )
+    } else {
+        (Err(RevisionPositionError::NotAtRevision), None)
+    };
+    edit_at_position(workspace, command, position, replaced_item, window, cx);
+}
+
+/// Runs `command` on `position`'s revision and opens its file there. The
+/// opened file takes the place of `replaced_item`, when given.
+pub(crate) fn edit_at_position(
+    workspace: &mut Workspace,
+    command: RevisionCommand,
+    position: std::result::Result<RevisionPosition, RevisionPositionError>,
+    replaced_item: Option<EntityId>,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let position = match position {
+        Ok(position) => position,
+        Err(error) => {
+            show_workspace_error(workspace, error.message(), cx);
+            return;
+        }
+    };
+
+    let project = workspace.project().clone();
+    if !project.read(cx).is_local() {
+        show_workspace_error(workspace, "jj commands need a local project", cx);
+        return;
+    }
+    let file_path = position.work_directory.join(position.path.as_std_path());
+    let Some(project_path) = project.read(cx).find_project_path(&file_path, cx) else {
+        show_workspace_error(
+            workspace,
+            format!("{} isn't in this project", file_path.display()),
+            cx,
+        );
+        return;
+    };
+    let file_name = position
+        .path
+        .file_name()
+        .map(ToString::to_string)
+        .unwrap_or_else(|| position.path.display(PathStyle::local()).to_string());
+    // jj rewrites the file on disk, which would leave these edits in a buffer
+    // that no longer matches the revision the cursor position comes from.
+    if project
+        .read(cx)
+        .get_open_buffer(&project_path, cx)
+        .is_some_and(|buffer| buffer.read(cx).is_dirty())
+    {
+        show_workspace_error(
+            workspace,
+            format!("Save or discard changes in {file_name} first"),
+            cx,
+        );
+        return;
+    }
+
+    let environment = project.update(cx, |project, cx| {
+        project.environment().update(cx, |environment, cx| {
+            environment.local_directory_environment(
+                &Shell::System,
+                position.work_directory.clone(),
+                cx,
+            )
+        })
+    });
+    let runner = JjRunner {
+        root: position.work_directory.clone(),
+        environment,
+    };
+    let pane = workspace.active_pane().downgrade();
+    cx.spawn_in(window, async move |workspace, cx| {
+        let root = match runner.run(&["workspace", "root"]).await {
+            Ok(output) => PathBuf::from(output.stdout.trim()),
+            Err(error) => {
+                workspace.update(cx, |workspace, cx| {
+                    show_jj_error(workspace, "workspace root".into(), &error, cx)
+                })?;
+                return anyhow::Ok(());
+            }
+        };
+        if root.as_path() != &*position.work_directory {
+            workspace.update(cx, |workspace, cx| {
+                show_workspace_error(
+                    workspace,
+                    "Editing at a revision needs a colocated git repository at the jj workspace root",
+                    cx,
+                )
+            })?;
+            return Ok(());
+        }
+
+        let revision = position.revision.to_string();
+        let state = runner
+            .run(&[
+                "log",
+                "--no-graph",
+                "--color=never",
+                "-r",
+                &revision,
+                "-T",
+                REVISION_STATE_TEMPLATE,
+            ])
+            .await
+            .and_then(|output| parse_revision_state(&output.stdout));
+        let state = match state {
+            Ok(state) => state,
+            Err(error) => {
+                workspace.update(cx, |workspace, cx| {
+                    show_jj_error(workspace, "log".into(), &error, cx)
+                })?;
+                return Ok(());
+            }
+        };
+        // A rewritten commit is hidden, and `jj new` on it would bring back the
+        // old version instead of the one the log shows now.
+        if state.is_hidden {
+            let short_revision = revision.get(..git::SHORT_SHA_LENGTH).unwrap_or(&revision);
+            workspace.update(cx, |workspace, cx| {
+                show_workspace_error(
+                    workspace,
+                    format!("{short_revision} was rewritten since this view opened. Reopen it first"),
+                    cx,
+                )
+            })?;
+            return Ok(());
+        }
+        if !state.is_working_copy
+            && let Err(error) = runner.run(&[command.name(), &revision]).await
+        {
+            workspace.update(cx, |workspace, cx| {
+                show_jj_error(workspace, command.name().into(), &error, cx)
+            })?;
+            return Ok(());
+        }
+
+        // An open buffer reloads only once the file watcher sees jj's write,
+        // which may be after the cursor is placed below, so reload it now.
+        let open_buffer = project.read_with(cx, |project, cx| project.get_open_buffer(&project_path, cx));
+        if let Some(buffer) = open_buffer {
+            project
+                .update(cx, |project, cx| {
+                    project.reload_buffers(HashSet::from_iter([buffer]), true, cx)
+                })
+                .await?;
+        }
+
+        let item = workspace
+            .update_in(cx, |workspace, window, cx| {
+                workspace.open_path(project_path, Some(pane.clone()), true, window, cx)
+            })?
+            .await?;
+        workspace.update_in(cx, |_, window, cx| {
+            if let Some(editor) = item.act_as::<Editor>(cx) {
+                editor.update(cx, |editor, cx| {
+                    let multibuffer = editor.buffer().read(cx);
+                    let Some(buffer) = multibuffer.as_singleton() else {
+                        return;
+                    };
+                    let point = buffer
+                        .read(cx)
+                        .snapshot()
+                        .clip_point(position.point, language::Bias::Left);
+                    let Some(anchor) = multibuffer.buffer_point_to_anchor(&buffer, point, cx)
+                    else {
+                        return;
+                    };
+                    editor.change_selections(
+                        SelectionEffects::scroll(Autoscroll::top_relative(
+                            position.line_offset_from_top,
+                        ))
+                        .nav_history(false),
+                        window,
+                        cx,
+                        |selections| selections.select_anchor_ranges([anchor..anchor]),
+                    );
+                });
+            }
+            if let Some(replaced_item) = replaced_item
+                && replaced_item != item.item_id()
+                && let Some(pane) = pane.upgrade()
+            {
+                pane.update(cx, |pane, cx| {
+                    pane.remove_item(replaced_item, false, false, window, cx)
+                });
+            }
+        })?;
+        Ok(())
+    })
+    .detach_and_notify_err(workspace.weak_handle(), window, cx);
+}
+
 /// The error's text without color codes. `jj log` runs with `--color=always`,
 /// which colors its errors too.
 fn plain_error_text(error: &anyhow::Error) -> String {
@@ -3214,6 +3508,26 @@ mod tests {
             parse_range_query(&query_output(&rows)).unwrap(),
             Err(DiffRefusal::Conflicted)
         );
+    }
+
+    #[test]
+    fn test_parse_revision_state() {
+        assert_eq!(
+            parse_revision_state("1\x1f\n").unwrap(),
+            RevisionState {
+                is_hidden: true,
+                is_working_copy: false,
+            }
+        );
+        assert_eq!(
+            parse_revision_state("\x1f1\n").unwrap(),
+            RevisionState {
+                is_hidden: false,
+                is_working_copy: true,
+            }
+        );
+        assert!(parse_revision_state("").is_err());
+        assert!(parse_revision_state("\x1f\n\x1f\n").is_err());
     }
 
     #[test]
