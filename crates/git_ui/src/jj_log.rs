@@ -8,7 +8,7 @@ use gpui::{
     App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, Font, FontFeatures,
     FontStyle, FontWeight, HighlightStyle, Hsla, KeyContext, ScrollStrategy, SharedString,
     StyledText, Subscription, Task, UnderlineStyle, UniformListScrollHandle, WeakEntity, Window,
-    actions, uniform_list,
+    actions, canvas, uniform_list,
 };
 use notifications::status_toast::StatusToast;
 use picker::{Picker, PickerDelegate};
@@ -239,6 +239,14 @@ struct JjOutput {
 
 impl JjRunner {
     async fn run(&self, args: &[&str]) -> Result<JjOutput> {
+        self.run_with_env(args, &[]).await
+    }
+
+    async fn run_with_env(
+        &self,
+        args: &[&str],
+        extra_environment: &[(&str, String)],
+    ) -> Result<JjOutput> {
         let environment = self.environment.clone().await.unwrap_or_default();
         let path_variable = environment
             .get("PATH")
@@ -250,6 +258,7 @@ impl JjRunner {
             .args(args)
             .current_dir(&self.root)
             .envs(&environment)
+            .envs(extra_environment.iter().map(|(key, value)| (key, value)))
             // Commands run here have no terminal, so a command that wants an
             // editor would hang forever. Make it fail instead.
             .env("JJ_EDITOR", "false")
@@ -615,6 +624,10 @@ pub struct JjLog {
     placement: Option<(PlacementKind, Vec<Revision>)>,
     show_stat: bool,
     revset: Option<String>,
+    /// The width of the view in characters, passed to jj as `COLUMNS` so that
+    /// `--stat` output fills the view instead of jj's 80-column fallback.
+    columns: Option<usize>,
+    resize_refresh_task: Option<Task<()>>,
     loaded: bool,
     status: Option<Status>,
     refresh_task: Option<Task<()>>,
@@ -667,6 +680,8 @@ impl JjLog {
             placement: None,
             show_stat: true,
             revset: None,
+            columns: None,
+            resize_refresh_task: None,
             loaded: false,
             status: None,
             refresh_task: None,
@@ -688,6 +703,7 @@ impl JjLog {
         let runner = self.runner.clone();
         let show_stat = self.show_stat;
         let revset = self.revset.clone();
+        let columns = self.columns;
         self.refresh_task = Some(cx.spawn(async move |this, cx| {
             let output = cx
                 .background_spawn(async move {
@@ -711,7 +727,11 @@ impl JjLog {
                         args.push("-r".to_string());
                         args.push(revset);
                     }
-                    let output = runner.run_owned(args).await?;
+                    let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+                    let environment = columns.map(|columns| ("COLUMNS", columns.to_string()));
+                    let output = runner
+                        .run_with_env(&args, environment.as_slice())
+                        .await?;
                     anyhow::Ok(parse_log_output(&output.stdout))
                 })
                 .await;
@@ -999,6 +1019,34 @@ impl JjLog {
     fn toggle_stat(&mut self, _: &ToggleStat, _: &mut Window, cx: &mut Context<Self>) {
         self.show_stat = !self.show_stat;
         self.refresh(cx);
+    }
+
+    fn set_columns(&mut self, columns: usize, cx: &mut Context<Self>) {
+        if self.columns == Some(columns) {
+            return;
+        }
+        let is_first_measurement = self.columns.is_none();
+        self.columns = Some(columns);
+        if !self.show_stat {
+            return;
+        }
+        if is_first_measurement {
+            self.resize_refresh_task = None;
+            self.refresh(cx);
+            return;
+        }
+        // Resizing a pane reports a new width on every frame, so wait for it to
+        // settle instead of running jj for each one.
+        self.resize_refresh_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(200))
+                .await;
+            this.update(cx, |this, cx| {
+                this.resize_refresh_task = None;
+                this.refresh(cx);
+            })
+            .ok();
+        }));
     }
 
     /// The revision under the cursor, or every revision touched by the visual
@@ -2074,8 +2122,16 @@ impl Item for JjLog {
 }
 
 impl Render for JjLog {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let text_style = log_text_style(cx);
+        let character_width = window
+            .text_system()
+            .em_advance(
+                window.text_system().resolve_font(&text_style.font),
+                text_style.font_size,
+            )
+            .log_err()
+            .filter(|width| *width > px(0.));
         let font = text_style.font;
         let font_size = text_style.font_size;
         let line_height = text_style.line_height;
@@ -2100,6 +2156,7 @@ impl Render for JjLog {
         v_flex()
             .key_context(self.key_context(cx))
             .track_focus(&self.focus_handle)
+            .relative()
             .size_full()
             .bg(colors.editor_background)
             .font(font)
@@ -2146,6 +2203,23 @@ impl Render for JjLog {
             .on_action(cx.listener(Self::place_before_ignore_immutable))
             .on_action(cx.listener(Self::run_custom_command))
             .on_action(cx.listener(Self::run_custom_command_by_name))
+            .when_some(character_width, |this, character_width| {
+                let log = cx.entity();
+                this.child(
+                    canvas(
+                        move |bounds, window, cx| {
+                            // Lines have `px_2` padding on each side.
+                            let padding = rems(1.).to_pixels(window.rem_size());
+                            let columns =
+                                ((bounds.size.width - padding) / character_width).max(1.) as usize;
+                            log.update(cx, |log, cx| log.set_columns(columns, cx));
+                        },
+                        |_, _, _, _| {},
+                    )
+                    .absolute()
+                    .size_full(),
+                )
+            })
             .child(
                 uniform_list(
                     "jj-log-lines",
