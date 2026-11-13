@@ -1,4 +1,6 @@
-use crate::{commit_view::CommitView, picker_prompt, project_diff::ProjectDiff};
+use crate::{
+    branch_diff::BranchDiff, commit_view::CommitView, picker_prompt, project_diff::ProjectDiff,
+};
 use anyhow::{Context as _, Result, anyhow};
 use collections::HashMap;
 use editor::Editor;
@@ -28,6 +30,7 @@ use util::ResultExt as _;
 use workspace::{
     ModalView, Workspace,
     item::{Item, ItemEvent},
+    notifications::NotifyTaskExt as _,
 };
 
 pub const JJ_COMMAND_TASK_TAG: &str = "jj-command";
@@ -35,7 +38,7 @@ pub(crate) const CUSTOM_JJ_COMMANDS_DOCS_SLUG: &str = "tasks#custom-jj-commands"
 
 const FIELD_SEPARATOR: char = '\u{1f}';
 const MARKER_END: char = '\u{1e}';
-const MARKER_FIELD_COUNT: usize = 9;
+const MARKER_FIELD_COUNT: usize = 10;
 
 // Prefixed to the user's own `templates.log` so every revision's first line
 // carries its identity. The log view strips it back out before rendering.
@@ -49,6 +52,7 @@ const MARKER_TEMPLATE: &str = concat!(
     r#" ++ "\x1f" ++ if(immutable, "1")"#,
     r#" ++ "\x1f" ++ parents.len()"#,
     r#" ++ "\x1f" ++ local_bookmarks.map(|b| b.name()).join(" ")"#,
+    r#" ++ "\x1f" ++ if(conflict, "1")"#,
     r#" ++ "\x1e""#,
 );
 
@@ -319,6 +323,7 @@ struct Revision {
     is_immutable: bool,
     parent_count: usize,
     bookmarks: Vec<String>,
+    is_conflicted: bool,
     first_line: usize,
 }
 
@@ -400,6 +405,7 @@ fn parse_marker(marker: &str, first_line: usize) -> Option<Revision> {
         is_immutable,
         parent_count,
         bookmarks,
+        is_conflicted,
     ] = <[&str; MARKER_FIELD_COUNT]>::try_from(fields).ok()?;
     Some(Revision {
         change_id: change_id.to_string(),
@@ -416,6 +422,7 @@ fn parse_marker(marker: &str, first_line: usize) -> Option<Revision> {
             .split_whitespace()
             .map(ToString::to_string)
             .collect(),
+        is_conflicted: !is_conflicted.is_empty(),
         first_line,
     })
 }
@@ -729,9 +736,7 @@ impl JjLog {
                     }
                     let args = args.iter().map(String::as_str).collect::<Vec<_>>();
                     let environment = columns.map(|columns| ("COLUMNS", columns.to_string()));
-                    let output = runner
-                        .run_with_env(&args, environment.as_slice())
-                        .await?;
+                    let output = runner.run_with_env(&args, environment.as_slice()).await?;
                     anyhow::Ok(parse_log_output(&output.stdout))
                 })
                 .await;
@@ -1370,9 +1375,10 @@ impl JjLog {
     }
 
     fn view_diff(&mut self, _: &ViewDiff, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(revision) = self.revision_under_cursor(cx) else {
+        let revisions = self.take_selected_revisions(cx);
+        if revisions.is_empty() {
             return;
-        };
+        }
         let root = self.runner.root.clone();
         let repository = self
             .project
@@ -1391,11 +1397,28 @@ impl JjLog {
             );
             return;
         };
+        match revisions.as_slice() {
+            [revision] => self.view_revision_diff(revision.clone(), repository, window, cx),
+            _ => self.view_range_diff(&revisions, repository, window, cx),
+        }
+    }
+
+    fn view_revision_diff(
+        &mut self,
+        revision: Revision,
+        repository: Entity<Repository>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         // In a colocated repository jj points git's HEAD at `@-` and keeps the
         // index matching it, so git's uncommitted changes are exactly `@`'s
         // changes, shown on the real, editable files. With several parents,
         // HEAD can only name one of them, so merges keep the commit view.
         let show_working_copy = revision.is_working_copy && revision.parent_count == 1;
+        if revision.is_conflicted && !show_working_copy {
+            self.refuse_diff(DiffRefusal::Conflicted, cx);
+            return;
+        }
         if show_working_copy {
             repository.update(cx, |repository, cx| repository.set_as_active_repository(cx));
         }
@@ -1412,6 +1435,101 @@ impl JjLog {
                     }
                 })
                 .log_err();
+        });
+    }
+
+    /// Diffs a run of revisions as one change, from the parent of its oldest
+    /// revision to its newest. jj resolves the selection, so the run is checked
+    /// against the whole graph, including revisions the log elides.
+    fn view_range_diff(
+        &mut self,
+        revisions: &[Revision],
+        repository: Entity<Repository>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let selection = revisions
+            .iter()
+            .map(Revision::revset)
+            .collect::<Vec<_>>()
+            .join(" | ");
+        let runner = self.runner.clone();
+        let task = cx.spawn_in(window, async move |this, cx| {
+            let output = cx
+                .background_spawn(
+                    async move { runner.run_owned(range_query_args(&selection)).await },
+                )
+                .await?;
+            let selected_range = parse_range_query(&output.stdout)?;
+            this.update_in(cx, |this, window, cx| match selected_range {
+                Ok(selected_range) => {
+                    this.open_selected_range(selected_range, repository, window, cx)
+                }
+                Err(refusal) => this.refuse_diff(refusal, cx),
+            })
+        });
+        self.report_task_error("log", task, cx);
+    }
+
+    fn open_selected_range(
+        &mut self,
+        selected_range: SelectedRange,
+        repository: Entity<Repository>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let workspace = self.workspace.clone();
+        let project = self.project.clone();
+        // Adding or activating a tab reads every item in the pane, this log
+        // included, which panics while this log is still being updated.
+        window.defer(cx, move |window, cx| {
+            workspace
+                .update(cx, |workspace, cx| {
+                    // HEAD is `@-` here, so the branch diff from the run's base
+                    // shows the run through the current, editable files.
+                    if selected_range.ends_at_working_copy {
+                        BranchDiff::deploy_branch_diff_with_base_ref(
+                            workspace,
+                            project,
+                            repository,
+                            selected_range.base.into(),
+                            None,
+                            None,
+                            window,
+                            cx,
+                        );
+                    } else {
+                        open_range_diff(
+                            workspace,
+                            repository,
+                            selected_range.base,
+                            selected_range.head,
+                            window,
+                            cx,
+                        );
+                    }
+                })
+                .log_err();
+        });
+    }
+
+    fn refuse_diff(&mut self, refusal: DiffRefusal, cx: &mut Context<Self>) {
+        let message = refusal.message();
+        self.set_status(message.clone(), true, cx);
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        cx.defer(move |cx| {
+            workspace.update(cx, |workspace, cx| {
+                let toast = StatusToast::new(message, cx, |this, _| {
+                    this.icon(
+                        Icon::new(IconName::Warning)
+                            .size(IconSize::Small)
+                            .color(Color::Warning),
+                    )
+                });
+                workspace.toggle_status_toast(toast, cx);
+            });
         });
     }
 
@@ -1985,6 +2103,195 @@ fn open_commit_diff(
         window,
         cx,
     );
+}
+
+/// Shows a range of commits, reusing an open view of the same range.
+fn open_range_diff(
+    workspace: &mut Workspace,
+    repository: Entity<Repository>,
+    base: String,
+    head: String,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let existing = workspace.items_of_type::<CommitView>(cx).find(|view| {
+        let view = view.read(cx);
+        view.repository() == &repository
+            && view
+                .range_endpoints()
+                .is_some_and(|(view_base, view_head)| {
+                    view_base.as_ref() == base && view_head.as_ref() == head
+                })
+    });
+    if let Some(existing) = existing {
+        workspace.activate_item(&existing, true, true, window, cx);
+        return;
+    }
+    let workspace_handle = workspace.weak_handle();
+    CommitView::open_range(base, head, repository, workspace_handle.clone(), window, cx)
+        .detach_and_notify_err(workspace_handle, window, cx);
+}
+
+/// A run of revisions that can be shown as one diff.
+#[derive(Debug, PartialEq)]
+struct SelectedRange {
+    /// The commit ID of the parent of the run's oldest revision.
+    base: String,
+    /// The commit ID of the run's newest revision.
+    head: String,
+    ends_at_working_copy: bool,
+}
+
+#[derive(Debug, PartialEq)]
+enum DiffRefusal {
+    Conflicted,
+    MultipleRoots(usize),
+    MultipleHeads(usize),
+    Gaps,
+    Merge,
+    StartsAtRoot,
+}
+
+impl DiffRefusal {
+    fn message(&self) -> SharedString {
+        match self {
+            DiffRefusal::Conflicted => "Conflicted commit views not supported yet".into(),
+            DiffRefusal::MultipleRoots(count) => {
+                format!("Selection has {count} roots; diffs need one linear run").into()
+            }
+            DiffRefusal::MultipleHeads(count) => {
+                format!("Selection has {count} heads; diffs need one linear run").into()
+            }
+            DiffRefusal::Gaps => {
+                "Selection skips revisions between its ends, including any the log hides".into()
+            }
+            DiffRefusal::Merge => "Selection includes a merge; diffs need one linear run".into(),
+            DiffRefusal::StartsAtRoot => {
+                "Diffs that start at the root commit aren't supported yet".into()
+            }
+        }
+    }
+}
+
+const RANGE_QUERY_FIELD_COUNT: usize = 9;
+
+/// A `jj log` over the selection's span and the parent of its root, with each
+/// revision's role in the selection.
+fn range_query_args(selection: &str) -> Vec<String> {
+    let template = [
+        "commit_id".to_string(),
+        format!(r#"if(self.contained_in("{selection}"), "1")"#),
+        format!(r#"if(self.contained_in("roots({selection})"), "1")"#),
+        format!(r#"if(self.contained_in("heads({selection})"), "1")"#),
+        format!(r#"if(self.contained_in("roots({selection})-"), "1")"#),
+        r#"if(conflict, "1")"#.to_string(),
+        r#"if(current_working_copy, "1")"#.to_string(),
+        "parents.len()".to_string(),
+        r#"if(root, "1")"#.to_string(),
+    ]
+    .join(r#" ++ "\x1f" ++ "#)
+        + r#" ++ "\n""#;
+    vec![
+        "log".to_string(),
+        "--no-graph".to_string(),
+        "--color=never".to_string(),
+        "-r".to_string(),
+        format!("roots({selection})::heads({selection}) | roots({selection})-"),
+        "-T".to_string(),
+        template,
+    ]
+}
+
+struct RangeQueryRow<'a> {
+    commit_id: &'a str,
+    is_selected: bool,
+    is_selection_root: bool,
+    is_selection_head: bool,
+    is_base: bool,
+    is_conflicted: bool,
+    is_working_copy: bool,
+    parent_count: usize,
+    is_root_commit: bool,
+}
+
+/// Checks that the selection is one contiguous, linear run and finds its
+/// ends. Malformed output is an error; a selection that can't be shown is a
+/// refusal.
+fn parse_range_query(output: &str) -> Result<std::result::Result<SelectedRange, DiffRefusal>> {
+    let rows = output
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            let fields = line.split(FIELD_SEPARATOR).collect::<Vec<_>>();
+            let [
+                commit_id,
+                is_selected,
+                is_selection_root,
+                is_selection_head,
+                is_base,
+                is_conflicted,
+                is_working_copy,
+                parent_count,
+                is_root_commit,
+            ] = <[&str; RANGE_QUERY_FIELD_COUNT]>::try_from(fields)
+                .map_err(|_| anyhow!("unexpected jj log output: {line:?}"))?;
+            Ok(RangeQueryRow {
+                commit_id,
+                is_selected: !is_selected.is_empty(),
+                is_selection_root: !is_selection_root.is_empty(),
+                is_selection_head: !is_selection_head.is_empty(),
+                is_base: !is_base.is_empty(),
+                is_conflicted: !is_conflicted.is_empty(),
+                is_working_copy: !is_working_copy.is_empty(),
+                parent_count: parent_count
+                    .parse()
+                    .with_context(|| format!("invalid parent count in jj log output: {line:?}"))?,
+                is_root_commit: !is_root_commit.is_empty(),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let roots = rows
+        .iter()
+        .filter(|row| row.is_selection_root)
+        .collect::<Vec<_>>();
+    let heads = rows
+        .iter()
+        .filter(|row| row.is_selection_head)
+        .collect::<Vec<_>>();
+    let bases = rows.iter().filter(|row| row.is_base).collect::<Vec<_>>();
+    if roots.len() != 1 {
+        return Ok(Err(DiffRefusal::MultipleRoots(roots.len())));
+    }
+    if heads.len() != 1 {
+        return Ok(Err(DiffRefusal::MultipleHeads(heads.len())));
+    }
+    if rows
+        .iter()
+        .any(|row| row.is_selected && row.parent_count > 1)
+    {
+        return Ok(Err(DiffRefusal::Merge));
+    }
+    if rows.iter().any(|row| !row.is_selected && !row.is_base) {
+        return Ok(Err(DiffRefusal::Gaps));
+    }
+    let [base] = bases.as_slice() else {
+        return Ok(Err(DiffRefusal::StartsAtRoot));
+    };
+    if base.is_root_commit {
+        return Ok(Err(DiffRefusal::StartsAtRoot));
+    }
+    let head = heads[0];
+    // A run that ends at `@` shows the live files, where jj writes conflict
+    // markers. Anywhere else, git sees jj's internal layout of the conflict.
+    if base.is_conflicted || (head.is_conflicted && !head.is_working_copy) {
+        return Ok(Err(DiffRefusal::Conflicted));
+    }
+    Ok(Ok(SelectedRange {
+        base: base.commit_id.to_string(),
+        head: head.commit_id.to_string(),
+        ends_at_working_copy: head.is_working_copy,
+    }))
 }
 
 /// The error's text without color codes. `jj log` runs with `--color=always`,
@@ -2648,9 +2955,9 @@ mod tests {
     #[test]
     fn test_parse_log_output_assigns_lines_to_revisions() {
         let output = concat!(
-            "\x1b[1m\x1b[38;5;2m@\x1b[0m  \x1f\x1b[38;5;5mvxqo\x1b[39m\x1f\x1b[1mv\x1b[0m\x1fcdae\x1fc\x1f1\x1f\x1f\x1f1\x1f\x1evxqopwrx me\n",
+            "\x1b[1m\x1b[38;5;2m@\x1b[0m  \x1f\x1b[38;5;5mvxqo\x1b[39m\x1f\x1b[1mv\x1b[0m\x1fcdae\x1fc\x1f1\x1f\x1f\x1f1\x1f\x1f\x1evxqopwrx me\n",
             "│  (no description set)\n",
-            "◆  \x1fuzqr\x1fu\x1f8e47\x1f8\x1f\x1f\x1f1\x1f2\x1fmain feature\x1euzqrlmow main\n",
+            "◆  \x1fuzqr\x1fu\x1f8e47\x1f8\x1f\x1f\x1f1\x1f2\x1fmain feature\x1f1\x1euzqrlmow main\n",
             "│  gpui: a commit\n",
             "~\n",
         );
@@ -2682,6 +2989,7 @@ mod tests {
                     is_immutable: false,
                     parent_count: 1,
                     bookmarks: Vec::new(),
+                    is_conflicted: false,
                     first_line: 0,
                 },
                 Revision {
@@ -2694,6 +3002,7 @@ mod tests {
                     is_immutable: true,
                     parent_count: 2,
                     bookmarks: vec!["main".into(), "feature".into()],
+                    is_conflicted: true,
                     first_line: 2,
                 },
             ]
@@ -2703,7 +3012,7 @@ mod tests {
 
     #[test]
     fn test_divergent_revision_uses_commit_id() {
-        let revision = parse_marker("x\x1fx\x1fabc\x1fa\x1f\x1f1\x1f\x1f1\x1f", 0).unwrap();
+        let revision = parse_marker("x\x1fx\x1fabc\x1fa\x1f\x1f1\x1f\x1f1\x1f\x1f", 0).unwrap();
         assert_eq!(revision.revset(), "abc");
         assert_eq!(revision.short_id(), "a");
     }
@@ -2757,8 +3066,159 @@ mod tests {
 
     #[test]
     fn test_unreadable_parent_count_is_zero() {
-        let revision = parse_marker("x\x1fx\x1fabc\x1fa\x1f1\x1f\x1f\x1fmany\x1f", 0).unwrap();
+        let revision = parse_marker("x\x1fx\x1fabc\x1fa\x1f1\x1f\x1f\x1fmany\x1f\x1f", 0).unwrap();
         assert_eq!(revision.parent_count, 0);
         assert!(parse_marker("x\x1fx\x1fabc\x1fa\x1f1\x1f\x1f\x1f", 0).is_none());
+    }
+
+    /// One `jj log` row of the range query, in the order `range_query_args`
+    /// prints its fields.
+    #[derive(Default)]
+    struct QueryRow {
+        commit_id: &'static str,
+        selected: bool,
+        selection_root: bool,
+        selection_head: bool,
+        base: bool,
+        conflicted: bool,
+        working_copy: bool,
+        parent_count: usize,
+        root_commit: bool,
+    }
+
+    fn query_output(rows: &[QueryRow]) -> String {
+        let flag = |value: bool| if value { "1" } else { "" };
+        rows.iter()
+            .map(|row| {
+                [
+                    row.commit_id.to_string(),
+                    flag(row.selected).to_string(),
+                    flag(row.selection_root).to_string(),
+                    flag(row.selection_head).to_string(),
+                    flag(row.base).to_string(),
+                    flag(row.conflicted).to_string(),
+                    flag(row.working_copy).to_string(),
+                    row.parent_count.to_string(),
+                    flag(row.root_commit).to_string(),
+                ]
+                .join("\x1f")
+                    + "\n"
+            })
+            .collect()
+    }
+
+    /// `head`, `middle` and `root` selected, on top of `base`.
+    fn linear_run() -> Vec<QueryRow> {
+        vec![
+            QueryRow {
+                commit_id: "head",
+                selected: true,
+                selection_head: true,
+                parent_count: 1,
+                ..Default::default()
+            },
+            QueryRow {
+                commit_id: "middle",
+                selected: true,
+                parent_count: 1,
+                ..Default::default()
+            },
+            QueryRow {
+                commit_id: "root",
+                selected: true,
+                selection_root: true,
+                parent_count: 1,
+                ..Default::default()
+            },
+            QueryRow {
+                commit_id: "base",
+                base: true,
+                parent_count: 1,
+                ..Default::default()
+            },
+        ]
+    }
+
+    #[test]
+    fn test_range_query_accepts_linear_run() {
+        assert_eq!(
+            parse_range_query(&query_output(&linear_run())).unwrap(),
+            Ok(SelectedRange {
+                base: "base".into(),
+                head: "head".into(),
+                ends_at_working_copy: false,
+            })
+        );
+
+        let mut rows = linear_run();
+        rows[0].working_copy = true;
+        rows[0].conflicted = true;
+        assert_eq!(
+            parse_range_query(&query_output(&rows)).unwrap(),
+            Ok(SelectedRange {
+                base: "base".into(),
+                head: "head".into(),
+                ends_at_working_copy: true,
+            })
+        );
+    }
+
+    #[test]
+    fn test_range_query_refuses_unshowable_selections() {
+        let mut rows = linear_run();
+        rows[1].selected = false;
+        assert_eq!(
+            parse_range_query(&query_output(&rows)).unwrap(),
+            Err(DiffRefusal::Gaps)
+        );
+
+        let mut rows = linear_run();
+        rows[1].selection_head = true;
+        assert_eq!(
+            parse_range_query(&query_output(&rows)).unwrap(),
+            Err(DiffRefusal::MultipleHeads(2))
+        );
+
+        let mut rows = linear_run();
+        rows[1].selection_root = true;
+        assert_eq!(
+            parse_range_query(&query_output(&rows)).unwrap(),
+            Err(DiffRefusal::MultipleRoots(2))
+        );
+
+        let mut rows = linear_run();
+        rows[1].parent_count = 2;
+        assert_eq!(
+            parse_range_query(&query_output(&rows)).unwrap(),
+            Err(DiffRefusal::Merge)
+        );
+
+        let mut rows = linear_run();
+        rows[3].root_commit = true;
+        assert_eq!(
+            parse_range_query(&query_output(&rows)).unwrap(),
+            Err(DiffRefusal::StartsAtRoot)
+        );
+
+        let mut rows = linear_run();
+        rows[0].conflicted = true;
+        assert_eq!(
+            parse_range_query(&query_output(&rows)).unwrap(),
+            Err(DiffRefusal::Conflicted)
+        );
+
+        let mut rows = linear_run();
+        rows[0].working_copy = true;
+        rows[3].conflicted = true;
+        assert_eq!(
+            parse_range_query(&query_output(&rows)).unwrap(),
+            Err(DiffRefusal::Conflicted)
+        );
+    }
+
+    #[test]
+    fn test_range_query_rejects_malformed_output() {
+        assert!(parse_range_query("head\x1f1\n").is_err());
+        assert!(parse_range_query("head\x1f1\x1f\x1f1\x1f\x1f\x1f\x1fmany\x1f\n").is_err());
     }
 }

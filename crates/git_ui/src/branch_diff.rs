@@ -466,12 +466,17 @@ impl Item for BranchDiff {
     }
 
     fn tab_tooltip_text(&self, cx: &App) -> Option<SharedString> {
-        Some(self.tab_content_text(0, cx))
+        Some(match self.diff_base(cx) {
+            DiffBase::Merge { base_ref } => format!("Changes since {base_ref}").into(),
+            DiffBase::Head | DiffBase::Index | DiffBase::Staged => "Changes".into(),
+        })
     }
 
     fn tab_content_text(&self, _detail: usize, cx: &App) -> SharedString {
         match self.diff_base(cx) {
-            DiffBase::Merge { base_ref } => format!("Changes since {}", base_ref).into(),
+            DiffBase::Merge { base_ref } => {
+                format!("Changes since {}", abbreviate_commit_sha(base_ref)).into()
+            }
             DiffBase::Head | DiffBase::Index | DiffBase::Staged => "Changes".into(),
         }
     }
@@ -692,6 +697,18 @@ impl SerializableItem for BranchDiff {
 
     fn should_serialize(&self, _: &Self::Event) -> bool {
         false
+    }
+}
+
+/// Shortens a full commit SHA, such as one the jj log passes as a base, and
+/// leaves branch names and other refs as they are.
+fn abbreviate_commit_sha(base_ref: &str) -> &str {
+    let is_full_sha =
+        matches!(base_ref.len(), 40 | 64) && base_ref.bytes().all(|byte| byte.is_ascii_hexdigit());
+    if is_full_sha {
+        &base_ref[..git::SHORT_SHA_LENGTH]
+    } else {
+        base_ref
     }
 }
 
@@ -1259,5 +1276,19 @@ mod tests {
 
         assert_eq!(active_base_ref, "origin/main");
         assert_eq!(base_refs, vec!["origin/main", "topic"]);
+    }
+
+    #[test]
+    fn test_abbreviate_commit_sha() {
+        assert_eq!(
+            super::abbreviate_commit_sha("8e474e15a2b1c3d4e5f60718293a4b5c6d7e8f90"),
+            "8e474e1"
+        );
+        assert_eq!(super::abbreviate_commit_sha("main"), "main");
+        assert_eq!(
+            super::abbreviate_commit_sha("origin/feature"),
+            "origin/feature"
+        );
+        assert_eq!(super::abbreviate_commit_sha("8e474e1"), "8e474e1");
     }
 }

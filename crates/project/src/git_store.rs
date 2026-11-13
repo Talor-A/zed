@@ -41,8 +41,8 @@ use git::{
         Branch, BranchesScanResult, CommitData, CommitDetails, CommitFileStatus, CommitOptions,
         CreateWorktreeTarget, DiffStatType, DiffType, FetchOptions, FileHistoryChangedFileSets,
         GitCommitTemplate, GitRepository, InitialGraphCommitData, LogOrder, LogSource, PushOptions,
-        Remote, RemoteCommandOutput, RepoPath, ResetMode, SearchCommitArgs, UpstreamTrackingStatus,
-        Worktree as GitWorktree, delete_branch_flag, is_binary_content,
+        RangeLog, Remote, RemoteCommandOutput, RepoPath, ResetMode, SearchCommitArgs,
+        UpstreamTrackingStatus, Worktree as GitWorktree, delete_branch_flag, is_binary_content,
     },
     stash::{GitStash, StashEntry},
     status::{
@@ -7435,6 +7435,48 @@ impl Repository {
                             .collect::<Result<Vec<_>>>()?,
                         is_shallow_boundary: response.is_shallow_boundary,
                     })
+                }
+            }
+        })
+    }
+
+    pub fn load_range_diff(
+        &self,
+        base: String,
+        head: String,
+        cx: &App,
+    ) -> Task<Result<CommitDiff>> {
+        let repository_state = self.repository_state.clone();
+        let object_read_limiter = self.object_read_limiter.clone();
+        cx.spawn(async move |cx| {
+            let _permit = object_read_limiter.acquire_arc().await;
+            match repository_state.await.map_err(|err| anyhow::anyhow!(err))? {
+                RepositoryState::Local(LocalRepositoryState { backend, .. }) => backend
+                    .load_range_diff(base, head, cx.clone())
+                    .await
+                    .map(decode_commit_diff),
+                RepositoryState::Remote(_) => {
+                    anyhow::bail!("Diffing a range of commits isn't supported in remote projects")
+                }
+            }
+        })
+    }
+
+    pub fn log_range(
+        &self,
+        base: String,
+        head: String,
+        limit: usize,
+        cx: &App,
+    ) -> Task<Result<RangeLog>> {
+        let repository_state = self.repository_state.clone();
+        cx.background_spawn(async move {
+            match repository_state.await.map_err(|err| anyhow::anyhow!(err))? {
+                RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                    backend.log_range(base, head, limit).await
+                }
+                RepositoryState::Remote(_) => {
+                    anyhow::bail!("Diffing a range of commits isn't supported in remote projects")
                 }
             }
         })
